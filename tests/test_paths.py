@@ -124,10 +124,12 @@ class DevRootKeys(unittest.TestCase):
 
 class IsSecret(unittest.TestCase):
     def test_matches_the_contract_patterns(self):
-        for name in (".env", ".env.local", "id_rsa", "id_rsa.pub", "id_ed25519",
+        for name in (".env", ".env.local", "id_rsa", "id_rsa.pub", "id_ed25519", "id_ecdsa",
                      "server.pem", "app.key", "cert.p12", "token.json",
-                     "client_secret_123.json", "credentials.json", "service_account.json",
-                     "my-sa.json", "my-service-account.json", ".npmrc", ".netrc"):
+                     "client_secret_123.json", "credentials", "credentials.json", "service_account.json",
+                     "my-sa.json", "my-service-account.json", ".npmrc", ".netrc",
+                     "keystore.jks", "release.keystore", ".pgpass", ".git-credentials",
+                     "prod.tfvars", "auth.json"):
             self.assertTrue(paths.is_secret(name), name)
 
     def test_matches_by_basename_of_a_full_path(self):

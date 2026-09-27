@@ -191,9 +191,10 @@ def is_exec(key: str) -> bool:
 # ---- secret files: never synced, see docs/contract.md `dev` and `secrets` ----
 
 _SECRET_PATTERNS = (
-    ".env*", "*.pem", "*.key", "*.p12", "id_rsa*", "id_ed25519*", "token.json",
-    "client_secret*.json", "credentials*.json", "service_account*.json",
-    "*-sa.json", "*service-account*.json", ".npmrc", ".netrc",
+    ".env*", "*.pem", "*.key", "*.p12", "id_rsa*", "id_ed25519*", "id_ecdsa*", "token.json",
+    "client_secret*.json", "credentials", "credentials*.json", "service_account*.json",
+    "*-sa.json", "*service-account*.json", ".npmrc", ".netrc", "*.jks", "*.keystore",
+    ".pgpass", ".git-credentials", "*.tfvars", "auth.json",
 )
 
 

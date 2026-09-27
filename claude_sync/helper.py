@@ -187,14 +187,19 @@ def _walk_root(base_dir, items, root, warnings):
 
 
 def _is_repo(path):
-    return os.path.isdir(os.path.join(path, ".git"))
+    # A worktree's ".git" is a file (a "gitdir: ..." pointer), a normal repo's is a folder.
+    git = os.path.join(path, ".git")
+    return os.path.isdir(git) or os.path.isfile(git)
 
 
-def _walk_dev(home, warnings):
+def _walk_dev(m, warnings, dev_repos):
     """Yield rel paths (posix separators) of files under <home>/dev to sync: skip git
-    repos entirely except <repo>/.claude/settings.local.json, skip symlinks, secret
-    files and the dependency folders in DEV_SKIP_DIRS."""
-    top = os.path.join(home, "dev")
+    repos and worktrees entirely except <repo>/.claude/settings.local.json, skip
+    symlinks, SKIP_NAMES, secret files and the dependency folders in DEV_SKIP_DIRS.
+
+    dev_repos collects the neutral path of every repo, worktree and dependency folder
+    skipped, so the cli can tell a file that moved into one of those from a deletion."""
+    top = os.path.join(m.home, "dev")
     if not os.path.exists(top):
         return
     if os.path.islink(top):
@@ -210,15 +215,22 @@ def _walk_dev(home, warnings):
     for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
         dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
         if _is_repo(dirpath):
+            dev_repos.append(neutral(dirpath, m))
             settings = os.path.join(dirpath, ".claude", "settings.local.json")
             if os.path.isfile(settings) and not os.path.islink(settings):
                 yield os.path.relpath(settings, top).replace(os.sep, "/")
             dirnames[:] = []  # a repo's other files are git's job, not ours
             continue
-        dirnames[:] = [d for d in dirnames if d not in DEV_SKIP_DIRS]
+        kept = []
+        for d in dirnames:
+            if d in DEV_SKIP_DIRS:
+                dev_repos.append(neutral(os.path.join(dirpath, d), m))
+            else:
+                kept.append(d)
+        dirnames[:] = kept
         for fn in filenames:
             full = os.path.join(dirpath, fn)
-            if os.path.islink(full) or is_secret(fn):
+            if os.path.islink(full) or fn in SKIP_NAMES or is_secret(fn):
                 continue
             yield os.path.relpath(full, top).replace(os.sep, "/")
 
@@ -278,7 +290,7 @@ def cmd_inventory(args, stdin):
     cache = json.loads(stdin.decode()) if stdin else {}
     given_folders = args.get("folders", {})
     prefixes = args.get("prefixes", ())  # rule 1: [home, desktop] pairs of all machines
-    files, warnings, out_folders, folder_cwd_cache = {}, [], {}, {}
+    files, warnings, out_folders, folder_cwd_cache, dev_repos = {}, [], {}, {}, []
 
     def hash_of(key, data):
         return hashlib.sha256(normalize_bytes(key, data, m, prefixes=prefixes)).hexdigest()
@@ -303,14 +315,14 @@ def cmd_inventory(args, stdin):
 
     def handle_dev():
         dev_dir = os.path.join(m.home, "dev")
-        for rel in _walk_dev(m.home, warnings):
+        for rel in _walk_dev(m, warnings, dev_repos):
             key = key_for("dev", rel, m, None)
             files[key] = _hash_entry(key, os.path.join(dev_dir, rel), cache, hash_of)
 
     handle("cli", f"{m.home}/.claude", CLI_ITEMS)
     handle("desktop", m.desktop, DESKTOP_ITEMS)
     handle_dev()
-    return {"files": files, "folders": out_folders, "warnings": warnings}
+    return {"files": files, "folders": out_folders, "warnings": warnings, "dev_repos": sorted(set(dev_repos))}
 
 
 # --- pack / apply / delete / undo -------------------------------------------------------
@@ -323,6 +335,8 @@ def cmd_pack(args, stdin):
         for key in keys:
             if not safe_key(key):
                 raise ValueError(f"unsafe key: {key}")
+            if is_secret(key):  # rule 8: never pack a secret file's content
+                raise ValueError(f"secret key: {key}")
             path = key_to_path(key, m)
             try:
                 with open(path, "rb") as f:
@@ -384,6 +398,9 @@ def cmd_apply(args, stdin):
                     if not safe_key(rel):  # rule 3
                         errors.append(f"{member.name}: unsafe key")
                         continue
+                    if is_secret(rel):  # rule 8
+                        errors.append(f"{member.name}: secret key")
+                        continue
                     target = f"{root}/conflicts/{run_id}/{rel}"
                     if not _under_root(target, f"{root}/conflicts/{run_id}"):
                         errors.append(f"{member.name}: target escapes its root")
@@ -394,6 +411,9 @@ def cmd_apply(args, stdin):
                 key = member.name
                 if not safe_key(key):  # rule 3
                     errors.append(f"{key}: unsafe key")
+                    continue
+                if is_secret(key):  # rule 8: never write a secret file's content
+                    errors.append(f"{key}: secret key")
                     continue
                 target = key_to_path(key, dst)
                 if not _under_root(target, _key_root_dir(key, dst)):

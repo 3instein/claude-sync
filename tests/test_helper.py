@@ -53,6 +53,14 @@ class Base(unittest.TestCase):
         os.utime(p, (mtime, mtime))
         return p
 
+    def put_dev(self, m, rel, data, mtime=MTIME):
+        p = f"{m.home}/dev/{rel}"
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+        os.utime(p, (mtime, mtime))
+        return p
+
     def transcript(self, m):
         cwd = f"{m.home}/dev/x"
         data = json.dumps({"type": "user", "cwd": cwd, "sessionId": "s1"}, separators=(",", ":")).encode()
@@ -350,6 +358,58 @@ class InventoryWarnings(Base):
     def test_missing_item_is_not_a_warning(self):
         out = self.call(self.mac, "inventory", folders={})
         self.assertEqual(out["warnings"], [])
+
+
+class DevRepos(Base):
+    def test_dev_repos_lists_skipped_repos_worktrees_and_dependency_folders(self):
+        os.makedirs(f"{self.mac.home}/dev/myrepo/.git", exist_ok=True)
+        p = f"{self.mac.home}/dev/wt"
+        os.makedirs(p, exist_ok=True)
+        with open(f"{p}/.git", "w") as f:  # a worktree's .git is a file, not a folder
+            f.write("gitdir: /elsewhere\n")
+        self.put_dev(self.mac, "proj/node_modules/pkg/index.js", b"dependency")
+        out = self.call(self.mac, "inventory", folders={})
+        self.assertEqual(set(out["dev_repos"]), {"~/dev/myrepo", "~/dev/wt", "~/dev/proj/node_modules"})
+
+    def test_worktree_git_pointer_file_is_not_synced(self):
+        p = f"{self.mac.home}/dev/wt"
+        os.makedirs(p, exist_ok=True)
+        with open(f"{p}/.git", "w") as f:
+            f.write("gitdir: /elsewhere\n")
+        self.put_dev(self.mac, "wt/file.txt", b"tracked by the worktree")
+        out = self.call(self.mac, "inventory", folders={})
+        self.assertFalse(any(k.startswith("dev/wt/") for k in out["files"]))
+
+    def test_ds_store_is_skipped_under_dev(self):
+        self.put_dev(self.mac, ".DS_Store", b"junk")
+        self.put_dev(self.mac, "proj/keep.md", b"real file")
+        out = self.call(self.mac, "inventory", folders={})
+        self.assertNotIn("dev/.DS_Store", out["files"])
+        self.assertIn("dev/proj/keep.md", out["files"])
+
+    def test_secret_file_is_skipped_under_dev(self):
+        self.put_dev(self.mac, "proj/.env", b"SECRET=1")
+        out = self.call(self.mac, "inventory", folders={})
+        self.assertFalse(any(k.endswith(".env") for k in out["files"]))
+
+
+class SecretKeys(Base):
+    def test_pack_refuses_a_secret_key(self):
+        self.put_dev(self.mac, "proj/.env", b"SECRET=1")
+        with self.assertRaises(remote.RemoteError):
+            self.call(self.mac, "pack", keys=["dev/proj/.env"])
+
+    def test_apply_refuses_a_secret_member(self):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w|gz") as tar:
+            info = tarfile.TarInfo("dev/proj/.env")
+            info.size, info.mtime = 4, MTIME
+            tar.addfile(info, io.BytesIO(b"x=1\n"))
+        out = self.call(self.ubu, "apply", stdin=buf.getvalue(), run_id="rsecret",
+                        src={"home": self.mac.home, "desktop": self.mac.desktop})
+        self.assertEqual(out["written"], {})
+        self.assertEqual(len(out["errors"]), 1)
+        self.assertFalse(os.path.exists(f"{self.ubu.home}/dev/proj/.env"))
 
 
 class AtomicLock(Base):
