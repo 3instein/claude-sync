@@ -3,6 +3,7 @@ never changes a repo except `git fetch`. See docs/contract.md, the git row. Pyth
 import os
 import platform
 import shlex
+import signal
 import subprocess
 
 try:
@@ -14,43 +15,59 @@ FETCH_TIMEOUT = 30
 GIT_TIMEOUT = 10
 
 
-def _git_out(path, args):
+def _run_git(argv, timeout, use_bash_ic=False):
+    """Run a git command, or (for fetch, on Linux) the same command inside `bash -ic` so
+    ~/.bash_env tokens load. Runs in its own process group so a timeout kills the whole
+    tree (git can spawn ssh, an askpass prompt, a credential helper, ...), not only the
+    immediate child. Returns (returncode, stdout, stderr); returncode is None on a timeout
+    or a launch failure, and stderr then holds "timed out" or the launch exception."""
+    cmd = ["bash", "-ic", " ".join(shlex.quote(c) for c in argv)] if use_bash_ic else argv
     try:
-        res = subprocess.run(["git", "-C", path] + args, capture_output=True, text=True, timeout=GIT_TIMEOUT)
-    except Exception:
-        return None
-    return res.stdout.strip() if res.returncode == 0 else None
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+    except Exception as e:
+        return None, "", str(e)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, out, err
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            pass
+        proc.communicate()  # reap, now that the group is dead
+        return None, "", "timed out"
+
+
+def _fail(what, err):
+    return f"{what} timed out" if err == "timed out" else f"{what} failed: {(err or '').strip() or 'unknown error'}"
+
+
+def _git_out(path, args):
+    code, out, _ = _run_git(["git", "-C", path] + args, GIT_TIMEOUT)
+    return out.strip() if code == 0 else None
 
 
 def _fetch(path, system):
     """git fetch, 30s timeout; on Linux inside `bash -ic` so ~/.bash_env tokens load.
-    Never changes the repo otherwise. A failure is reported, not raised."""
-    cmd = ["git", "-C", path, "fetch"]
-    try:
-        if system == "Linux":
-            res = subprocess.run(["bash", "-ic", " ".join(shlex.quote(c) for c in cmd)],
-                                 capture_output=True, text=True, timeout=FETCH_TIMEOUT)
-        else:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=FETCH_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return "git fetch timed out"
-    except Exception as e:
-        return str(e)
-    return None if res.returncode == 0 else (res.stderr.strip() or "git fetch failed")
+    Never changes the repo otherwise. A failure or a timeout is reported, not raised."""
+    code, _, err = _run_git(["git", "-C", path, "fetch"], FETCH_TIMEOUT, use_bash_ic=(system == "Linux"))
+    return None if code == 0 else _fail("git fetch", err)
 
 
 def _status(path):
-    res = subprocess.run(["git", "-C", path, "status", "--porcelain"],
-                         capture_output=True, text=True, timeout=GIT_TIMEOUT)
+    code, out, err = _run_git(["git", "-C", path, "status", "--porcelain"], GIT_TIMEOUT)
+    if code != 0:
+        return [], [], _fail("git status", err)
     changed, untracked = [], []
-    for line in res.stdout.splitlines():
+    for line in out.splitlines():
         if not line:
             continue
         (untracked if line[:2] == "??" else changed).append(line[3:])
-    return changed, untracked
+    return changed, untracked, None
 
 
-def _scan_one(path, system):
+def _scan_one(path, system, kind):
     fetch_warning = _fetch(path, system)
     origin = _git_out(path, ["config", "--get", "remote.origin.url"])
     branch = _git_out(path, ["rev-parse", "--abbrev-ref", "HEAD"])
@@ -60,14 +77,15 @@ def _scan_one(path, system):
         counts = _git_out(path, ["rev-list", "--left-right", "--count", f"{upstream}...HEAD"])
         if counts and len(counts.split()) == 2:
             behind, ahead = (int(x) for x in counts.split())
-    changed, untracked = _status(path)
-    return {"path": path, "origin": origin, "branch": None if branch == "HEAD" else branch,
-            "upstream": upstream, "ahead": ahead, "behind": behind,
-            "changed": changed, "untracked": untracked, "fetch_warning": fetch_warning}
+    changed, untracked, status_warning = _status(path)
+    return {"path": path, "kind": kind, "origin": origin, "branch": None if branch == "HEAD" else branch,
+            "upstream": upstream, "ahead": ahead, "behind": behind, "changed": changed,
+            "untracked": untracked, "fetch_warning": fetch_warning, "status_warning": status_warning}
 
 
 def _find_repos(dev_dir):
-    """Repos under ~/dev, two levels deep: dev/x or dev/games/capsa."""
+    """Repos under ~/dev, two levels deep: dev/x or dev/games/capsa. A folder whose .git
+    is a file (a worktree) is never itself walked as a top-level repo here."""
     if not os.path.isdir(dev_dir):
         return []
     repos = []
@@ -93,23 +111,19 @@ def _find_worktrees(repo_path):
     """Every worktree `git worktree list` knows about, besides the main one. git resolves
     symlinks in the paths it reports; map a worktree back under repo_path's own (possibly
     symlinked) form, so it still sits under the machine's home for paths.neutral()."""
-    try:
-        res = subprocess.run(["git", "-C", repo_path, "worktree", "list", "--porcelain"],
-                             capture_output=True, text=True, timeout=GIT_TIMEOUT)
-    except Exception:
+    code, out, _ = _run_git(["git", "-C", repo_path, "worktree", "list", "--porcelain"], GIT_TIMEOUT)
+    if code != 0:
         return []
-    if res.returncode != 0:
-        return []
-    listed = [line[len("worktree "):] for line in res.stdout.splitlines() if line.startswith("worktree ")]
+    listed = [line[len("worktree "):] for line in out.splitlines() if line.startswith("worktree ")]
     real_repo = os.path.realpath(repo_path)
-    out = []
+    out_paths = []
     for p in listed:
         if os.path.realpath(p) == real_repo:
             continue  # the main worktree itself
         if p.startswith(real_repo + os.sep):
             p = repo_path + p[len(real_repo):]
-        out.append(p)
-    return out
+        out_paths.append(p)
+    return out_paths
 
 
 def cmd_git_scan(args, stdin):
@@ -117,9 +131,9 @@ def cmd_git_scan(args, stdin):
     dev_dir = f"{args['home']}/dev"
     repos = []
     for repo_path in _find_repos(dev_dir):
-        repos.append(_scan_one(repo_path, system))
+        repos.append(_scan_one(repo_path, system, "repo"))
         for wt_path in _find_worktrees(repo_path):
-            repos.append(_scan_one(wt_path, system))
+            repos.append(_scan_one(wt_path, system, "worktree"))
     return {"repos": repos}
 
 

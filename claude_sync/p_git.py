@@ -30,16 +30,25 @@ def _next_cmd(cmd, side, host):
     return f"ssh {host} " + shlex.quote("bash -ic " + shlex.quote(cmd))
 
 
+def _warn_failures(rec, m, ctx):
+    for warning in (rec.get("fetch_warning"), rec.get("status_warning")):
+        if warning:
+            ctx.result["warnings"].append(f"error: {m.name}: {rec['path']}: {warning}")
+
+
 def _classify(rec, side, m, ctx):
-    if rec.get("fetch_warning"):
-        ctx.result["warnings"].append(f"{m.name}: git fetch failed in {rec['path']}: {rec['fetch_warning']}")
+    _warn_failures(rec, m, ctx)
+    if rec["kind"] == "worktree":
+        # Fix round: never report a worktree as anything but an unpushed branch. A
+        # worktree present on only one machine is never "missing" either (below).
+        return None if rec["upstream"] else {"state": "unpushed_branch"}
     if rec["changed"] or rec["untracked"]:
         files = sorted(rec["changed"] + rec["untracked"])[:20]
         return {"state": "uncommitted", "files": files}
     if not rec["origin"]:
         return {"state": "no_remote"}
     if not rec["upstream"]:
-        return {"state": "unpushed_branch"}  # a worktree branch (or any branch) never pushed
+        return {"state": "unpushed_branch"}
     ahead, behind = rec["ahead"], rec["behind"]
     if ahead and behind:
         return {"state": "diverged"}
@@ -52,6 +61,25 @@ def _classify(rec, side, m, ctx):
     return None  # clean
 
 
+def _missing_repo_entry(neutral_path, here_rec, there_rec, mh, mt, ctx):
+    have_side, rec = ("here", here_rec) if here_rec else ("there", there_rec)
+    miss_side = "there" if have_side == "here" else "here"
+    m_miss = mt if miss_side == "there" else mh
+    origin = rec["origin"]
+    entry = {"machine": m_miss.name, "repo": neutral_path, "state": "missing"}
+    if origin and origin.startswith("-"):
+        # rule: a value from the other machine can never be read as an option; refuse to
+        # build a command from one that looks like a flag instead of guessing its intent.
+        ctx.result["warnings"].append(f"skipped: clone for {neutral_path}: origin looks unsafe ({origin!r})")
+    elif origin:
+        target = paths.localize(neutral_path, m_miss)
+        cmd = f"git clone -- {shlex.quote(origin)} {shlex.quote(target)}"
+        entry["next"] = _next_cmd(cmd, miss_side, m_miss.name)
+    else:  # nothing can be cloned, so a stop could never clear: warn only, as for no remote
+        ctx.result["warnings"].append(f"{neutral_path}: only on one machine, and it has no remote to clone")
+    return entry, "next" in entry
+
+
 def plan(ctx):
     mh, mt = ctx.side["here"][1], ctx.side["there"][1]
     scans = {"here": _scan(ctx, "here"), "there": _scan(ctx, "there")}
@@ -60,20 +88,16 @@ def plan(ctx):
         if _skipped(neutral_path, mh, mt, ctx.skip_repos):
             continue
         here_rec, there_rec = scans["here"].get(neutral_path), scans["there"].get(neutral_path)
-        if here_rec is None or there_rec is None:
-            have_side, rec = ("here", here_rec) if here_rec else ("there", there_rec)
-            miss_side = "there" if have_side == "here" else "here"
-            m_miss = mt if miss_side == "there" else mh
-            entry = {"machine": m_miss.name, "repo": neutral_path, "state": "missing"}
-            if rec["origin"]:
-                cmd = f"git clone {shlex.quote(rec['origin'])} {shlex.quote(paths.localize(neutral_path, m_miss))}"
-                entry["next"] = _next_cmd(cmd, miss_side, m_miss.name)
-                need_stop = True
-            else:  # nothing can be cloned, so a stop could never clear: warn only, as for no remote
-                ctx.result["warnings"].append(f"{neutral_path}: only on one machine, and it has no remote to clone")
+        kind = (here_rec or there_rec)["kind"]
+        if kind == "repo" and (here_rec is None or there_rec is None):
+            entry, has_next = _missing_repo_entry(neutral_path, here_rec, there_rec, mh, mt, ctx)
             reports.append(entry)
+            need_stop = need_stop or has_next
             continue
-        for side, rec in (("here", here_rec), ("there", there_rec)):
+        # A worktree missing on one machine is never reported at all (fix round): only
+        # classify the sides that actually have it.
+        sides = [(s, r) for s, r in (("here", here_rec), ("there", there_rec)) if r is not None]
+        for side, rec in sides:
             m = mh if side == "here" else mt
             entry = _classify(rec, side, m, ctx)
             if entry is None:

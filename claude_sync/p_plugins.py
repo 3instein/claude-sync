@@ -26,6 +26,14 @@ def _diff(current: dict, merged: dict):
 
 def plan(ctx):
     here, there = _read(ctx, "here"), _read(ctx, "there")
+    errors = [(side, rec["error"]) for side, rec in (("here", here), ("there", there)) if rec.get("error")]
+    if errors:
+        # An unreadable or unversioned plugin file must not read as "no plugins installed",
+        # or a plan would uninstall everything the state remembers. Plan nothing instead.
+        for side, err in errors:
+            ctx.result["warnings"].append(f"error: plugins on {ctx.side[side][1].name}: {err}")
+        ctx.result["parts"]["plugins"] = {}
+        return None
     if here == there:
         # Both machines already agree: safe to move the base, the same rule as groups.
         # Without this, a run that finds nothing to do never learns this shared state,
@@ -63,20 +71,23 @@ def _run(ctx, side, argv):
     r, m = ctx.side[side]
     out = json.loads(r.call("plugins_run", {"home": m.home, "desktop": m.desktop, "argv": argv}))
     if out.get("code", 1) != 0:
-        ctx.result["warnings"].append(f"{m.name}: claude plugin {' '.join(argv)} failed: {out.get('output', '')}")
+        shown = " ".join(a for a in argv if a != "--")  # "--" is real but noisy to read back
+        ctx.result["warnings"].append(f"error: claude plugin {shown} failed on {m.name}: {out.get('output', '')}")
 
 
 def apply(ctx, plan):
     for side, c in plan.items():
         for name, source in c["marketplace_add"]:
-            _run(ctx, side, ["marketplace", "add", source])
+            _run(ctx, side, ["marketplace", "add", "--", source])
         for pid in c["install"]:
-            _run(ctx, side, ["install", pid])
+            _run(ctx, side, ["install", "--", pid])
         for pid in c["uninstall"]:
-            _run(ctx, side, ["uninstall", pid])
+            _run(ctx, side, ["uninstall", "--", pid])
         for name in c["marketplace_remove"]:
-            _run(ctx, side, ["marketplace", "remove", name])
+            _run(ctx, side, ["marketplace", "remove", "--", name])
     here2, there2 = _read(ctx, "here"), _read(ctx, "there")
-    if sorted(here2["installed"]) == sorted(there2["installed"]) and here2["marketplaces"] == there2["marketplaces"]:
+    if not here2.get("error") and not there2.get("error") \
+            and sorted(here2["installed"]) == sorted(there2["installed"]) \
+            and here2["marketplaces"] == there2["marketplaces"]:
         ctx.part_state["plugins"] = {"installed": sorted(here2["installed"]), "marketplaces": here2["marketplaces"]}
     # else: leave ctx.part_state untouched, so the old state (or none) survives, per contract.

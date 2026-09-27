@@ -37,12 +37,17 @@ def save(p, obj):
         json.dump(obj, f)
 
 log = os.environ.get("FAKE_CLAUDE_LOG")
-argv = sys.argv[1:]
+raw_argv = sys.argv[1:]
 if log:
     with open(log, "a") as f:
-        f.write(json.dumps(argv) + "\\n")
+        f.write(json.dumps(raw_argv) + "\\n")
+argv = [a for a in raw_argv if a != "--"]
 if argv[:1] == ["plugin"]:
     argv = argv[1:]
+fail = os.environ.get("FAKE_CLAUDE_FAIL")
+if fail and fail in argv:
+    sys.stderr.write("fake claude: forced failure\\n")
+    sys.exit(1)
 if argv[0] == "install":
     data = load(installed_path)
     data.setdefault("version", 2)
@@ -156,8 +161,8 @@ class Plugins(unittest.TestCase):
         self.assertIn("foo-mkt", self.marketplaces(self.u))
         self.assertIn("plug@foo-mkt", self.installed(self.u))
         lines = self.log_lines()
-        add_i = lines.index(["plugin", "marketplace", "add", "someorg/foo-mkt"])
-        install_i = lines.index(["plugin", "install", "plug@foo-mkt"])
+        add_i = lines.index(["plugin", "marketplace", "add", "--", "someorg/foo-mkt"])
+        install_i = lines.index(["plugin", "install", "--", "plug@foo-mkt"])
         self.assertLess(add_i, install_i, "marketplaces before plugins")
 
     def test_marketplace_removed_on_one_machine_is_removed_on_the_other(self):
@@ -173,12 +178,54 @@ class Plugins(unittest.TestCase):
         code, out = self.sync("--confirm", out["token"])
         self.assertEqual(code, 0, out)
         self.assertNotIn("foo-mkt", self.marketplaces(self.m))
-        self.assertIn(["plugin", "marketplace", "remove", "foo-mkt"], self.log_lines())
+        self.assertIn(["plugin", "marketplace", "remove", "--", "foo-mkt"], self.log_lines())
 
     def test_run_rejects_unknown_argument_shapes(self):
-        for bad in (["install"], ["install", "a", "b"], ["marketplace", "list"], ["frobnicate"], ["uninstall", "a", "b"]):
+        bad_shapes = (
+            ["install", "a"],                    # old shape, no "--" separator
+            ["install", "--"],                    # missing the value
+            ["install", "--", "a", "b"],
+            ["marketplace", "list", "--", "a"],
+            ["frobnicate", "--", "a"],
+            ["uninstall", "--", "a", "b"],
+        )
+        for bad in bad_shapes:
             with self.assertRaises(ValueError):
                 h_plugins.cmd_plugins_run({"home": self.m["home"], "desktop": self.m["desktop"], "argv": bad}, b"")
+
+    def test_run_rejects_a_value_that_looks_like_an_option_even_after_the_separator(self):
+        # fix round 4: a clone URL/plugin id/marketplace source is content from the other
+        # machine and must never be read as an option, "--" or not.
+        for bad in (["install", "--", "-x"], ["marketplace", "add", "--", "--evil"],
+                   ["marketplace", "remove", "--", "-n"]):
+            with self.assertRaises(ValueError):
+                h_plugins.cmd_plugins_run({"home": self.m["home"], "desktop": self.m["desktop"], "argv": bad}, b"")
+
+    def test_failed_plugin_command_is_an_error_warning(self):
+        self.seed_installed(self.m, ["fail@bar"])
+        self.seed_installed(self.u, [])
+        self.env["FAKE_CLAUDE_FAIL"] = "fail@bar"
+        code, out = self.sync()
+        self.assertEqual((code, out["stopped"]), (3, ["exec_config"]), out)
+        code, out = self.sync("--confirm", out["token"])
+        self.assertEqual(code, 0, out)
+        errors = [w for w in out["warnings"] if w.startswith("error:")]
+        self.assertEqual(len(errors), 1, out)
+        self.assertIn("fail@bar", errors[0])
+        self.assertFalse(out["in_sync"], "a failure warning must not read as in sync")
+
+    def test_corrupt_installed_plugins_file_plans_nothing(self):
+        self.seed_installed(self.m, ["foo@bar"])
+        self.seed_installed(self.u, ["foo@bar"])
+        self.assertEqual(self.sync()[0], 0)
+        d = f"{self.u['home']}/.claude/plugins"
+        with open(f"{d}/installed_plugins.json", "w") as f:
+            f.write('{"version": 2, "plugins": {')  # truncated: not valid JSON
+        code, out = self.sync("status")
+        self.assertEqual(out["parts"]["plugins"], {}, "a broken file must plan nothing, not a mass uninstall")
+        self.assertTrue(any(w.startswith("error: plugins on ubu:") for w in out["warnings"]), out)
+        # the good machine's copy of foo@bar must survive untouched
+        self.assertIn("foo@bar", self.installed(self.m))
 
     def test_read_lists_user_scope_plugins_and_marketplace_sources(self):
         d = f"{self.m['home']}/.claude/plugins"
