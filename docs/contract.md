@@ -168,3 +168,16 @@ These rules replace the earlier text where they differ.
 9. **Undo.** `undo` requires a `run_id`; the cli uses the run id in the state and undoes it on both machines. The manifest records the mtime and size that the run wrote. `undo` skips a file that changed after the run, backs up the current file before it restores or removes, and reports skipped files.
 10. **Deletions.** Every deletion counts toward the limit: no exemption for old transcripts. A `keep` pattern also applies to rule 3: a kept deletion becomes a `copy` back.
 11. **Splits.** Before it writes anything, the cli resolves every `transcript` action. More than 10 splits in one run is a stop reason, `splits`, whose list is part of the review and the token.
+
+## Fix round 2 (real data, 2026-09-27)
+
+Read-only runs and the first real sync found these rules. They replace the earlier text where they differ.
+
+1. **Loose hash boundary.** The loose replacement uses a right boundary only (the path ends at `/`, the end, or a character that is not `[A-Za-z0-9_.-]`). Inside JSON strings a path often follows `\n` or `file://`, and a left boundary missed it: 194 transcripts would have split.
+2. **Both desktop layouts.** `cli.loose_prefixes` lists `<home>/Library/Application Support/Claude` and `<home>/.config/Claude` under each home, besides each machine's real desktop folder. The migration turned the Mac desktop folder into `/home/idkman/Library/Application Support/Claude`.
+3. **Metadata lines.** When the plain prefix check fails, `resolve_transcript` compares only the lines whose `type` is not in `merge.META_TYPES` (`cost-state`, `bridge-session`, `last-prompt`, `queue-operation`, `custom-title`, `agent-name`, `mode`, `atis-latch`, `pr-link`). If one copy's conversation starts with all of the other's, that copy wins, and the other copy's extra metadata lines are dropped.
+4. **Folder cwd.** `helper._folder_cwd` takes a folder's cwd only from a transcript line where `folder_name(cwd)` equals the folder name: first from the first 1 MB of each `.jsonl`, then from whole files. A session moved to another folder keeps its old cwd on its first lines. Without a match, the folder gets a `[slug]` key and the cli remaps it.
+5. **Skipped paths.** `model.SKIP_PATHS` holds paths under a root that are never synced: `skills/synced` (the desktop app syncs it itself from claude.ai for each machine).
+6. **Undo and the state.** `undo` also returns the `keys` it touched, and the cli removes them from the state on both machines, so the next run treats the two copies as a conflict. Before any write, the cli writes the new run id to the state, so `undo` finds a run that crashed.
+7. **Deterministic splits.** A split's new session id is `uuid5` of the key and the hash of the other machine's copy, so a run that crashed after a split does not split again.
+8. **Robust transfers.** `pack` skips a file deleted since the file list. The `apply` precondition compares a `.jsonl` size up to its last full line. A missing `projects` or `claude-code-sessions` folder is a warning only when the state had files there.
