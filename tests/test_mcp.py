@@ -1,9 +1,11 @@
 """End-to-end tests for the mcp part, with fake machines as in tests/test_cli.py."""
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,9 +34,12 @@ class McpPart(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr, p.stderr)
         return p.returncode, json.loads(p.stdout or "{}")
 
-    def put_claude_json(self, r, obj):
-        with open(f"{r['home']}/.claude.json", "w") as f:
+    def put_claude_json(self, r, obj, mtime=None):
+        p = f"{r['home']}/.claude.json"
+        with open(p, "w") as f:
             json.dump(obj, f)
+        if mtime is not None:
+            os.utime(p, (mtime, mtime))
 
     def get_claude_json(self, r):
         with open(f"{r['home']}/.claude.json") as f:
@@ -50,7 +55,8 @@ class McpPart(unittest.TestCase):
         cmd = f"{self.m['home']}/.local/bin/mytool"
         self.put_claude_json(self.m, {"mcpServers": {"tool": {"command": cmd, "args": ["--x"]}}})
         self.put_claude_json(self.u, {"theme": "dark"})
-        # a real file at the mapped path, so no PATH resolution is needed for this test
+        # a real file at the mapped path on both sides, so resolution finds it cleanly
+        self.make_exe(f"{self.m['home']}/.local/bin/mytool")
         self.make_exe(f"{self.u['home']}/.local/bin/mytool")
         code, out = self.sync()
         self.assertEqual((code, out["stopped"]), (3, ["exec_config"]), out)
@@ -87,6 +93,84 @@ class McpPart(unittest.TestCase):
         self.assertEqual(code, 0, out)  # nothing to confirm: the secret server is never copied
         self.assertTrue(any("secure" in w and "secret" in w for w in out["warnings"]), out["warnings"])
         self.assertNotIn("secure", self.get_claude_json(self.u).get("mcpServers", {}))
+
+    def test_path_valued_env_name_is_not_a_secret(self):
+        # google-sheets style: *_PATH env names hold file paths, not secrets.
+        self.put_claude_json(self.m, {"mcpServers": {"google-sheets": {
+            "command": "npx", "env": {"CREDENTIALS_PATH": "/Users/x/creds.json", "TOKEN_PATH": "~/token.json"}}}})
+        self.put_claude_json(self.u, {})
+        code, out = self.sync()
+        self.assertEqual((code, out["stopped"]), (3, ["exec_config"]), out)
+        code, out = self.sync("--confirm", out["token"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("google-sheets", self.get_claude_json(self.u)["mcpServers"])
+
+    def test_various_secret_patterns_are_all_skipped(self):
+        self.put_claude_json(self.m, {"mcpServers": {
+            "flag": {"command": "run", "args": ["--api-key", "sk-live-xyz"]},
+            "web": {"command": "npx", "url": "https://example.com/mcp?token=abc123"},
+            "db1": {"command": "run", "env": {"DB_PASS": "hunter2"}},
+            "db2": {"command": "run", "env": {"DATABASE_URL": "postgres://user:hunter2@host/db"}},
+        }})
+        self.put_claude_json(self.u, {})
+        code, out = self.sync()
+        self.assertEqual(code, 0, out)  # every server is a secret, so there is nothing to confirm
+        for name in ("flag", "web", "db1", "db2"):
+            self.assertTrue(any(name in w and "secret" in w for w in out["warnings"]), (name, out["warnings"]))
+        self.assertEqual(self.get_claude_json(self.u).get("mcpServers", {}), {})
+
+    def test_secret_survives_a_newer_copy_that_lost_it(self):
+        secret_server = {"command": "run", "env": {"API_TOKEN": "tok-abc"}}
+        self.put_claude_json(self.m, {"mcpServers": {"secure": dict(secret_server)}}, mtime=1000)
+        self.put_claude_json(self.u, {"mcpServers": {"secure": dict(secret_server)}}, mtime=1000)
+        self.assertEqual(self.sync("status")[0], 0, "both sides already match")
+        # ubuntu's copy is rewritten without the secret, and is newer
+        self.put_claude_json(self.u, {"mcpServers": {"secure": {"command": "run"}}}, mtime=2000)
+        code, out = self.sync()
+        self.assertEqual(code, 0, out)  # the secret server is excluded from the merge, nothing to confirm
+        self.assertFalse(out["in_sync"], "a warning about an unsynced secret keeps in_sync false")
+        self.assertEqual(self.get_claude_json(self.m)["mcpServers"]["secure"], secret_server,
+                         "the mac keeps its token even though ubuntu's newer copy lost it")
+
+    def test_resolved_command_does_not_bounce_back_to_the_source(self):
+        cmd = "/opt/claude-sync-test-does-not-exist/mytool"
+        self.put_claude_json(self.m, {"mcpServers": {"tool": {"command": cmd}}})
+        self.put_claude_json(self.u, {})
+        self.make_exe(f"{self.u['home']}/.local/bin/mytool")
+        code, out = self.sync()
+        self.sync("--confirm", out["token"])
+        # a second run must not carry ubuntu's resolved path (missing on the mac) back to it
+        code, out = self.sync("status")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.get_claude_json(self.m)["mcpServers"]["tool"]["command"], cmd)
+
+    def test_project_only_written_where_the_folder_exists(self):
+        exists_m, exists_u = f"{self.m['home']}/dev/exists", f"{self.u['home']}/dev/exists"
+        missing_m = f"{self.m['home']}/dev/missing"
+        os.makedirs(exists_m)
+        os.makedirs(exists_u)  # the matching folder exists on ubuntu too
+        os.makedirs(missing_m)  # nothing matching exists on ubuntu
+        self.put_claude_json(self.m, {"projects": {
+            exists_m: {"allowedTools": ["Bash"]}, missing_m: {"allowedTools": ["Bash"]}}})
+        self.put_claude_json(self.u, {})
+        code, out = self.sync()
+        self.assertEqual((code, out["stopped"]), (3, ["exec_config"]), out)
+        code, out = self.sync("--confirm", out["token"])
+        self.assertEqual(code, 0, out)
+        u_projects = self.get_claude_json(self.u).get("projects", {})
+        self.assertIn(exists_u, u_projects)
+        self.assertNotIn(f"{self.u['home']}/dev/missing", u_projects)
+
+    def test_review_item_has_a_content_hash_and_result_lists_the_json(self):
+        self.put_claude_json(self.m, {"mcpServers": {"tool": {"command": "npx", "args": ["-y", "x"]}}})
+        self.put_claude_json(self.u, {})
+        code, out = self.sync()
+        self.assertEqual(code, 3, out)
+        items = out["review"]["exec_config"]
+        self.assertTrue(items, out)
+        for side, item in items:
+            self.assertRegex(item, r"^mcp:[^@]+@[0-9a-f]{8}$", item)
+        self.assertEqual(out["parts"]["mcp"]["mcpServers"]["tool"]["args"], ["-y", "x"])
 
 
 if __name__ == "__main__":
