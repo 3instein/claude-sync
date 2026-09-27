@@ -16,6 +16,11 @@ from claude_sync.model import Machine
 MTIME = 1_790_000_000
 
 
+def read(p):
+    with open(p, "rb") as f:
+        return f.read()
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -102,11 +107,24 @@ class PackApplyUndo(Base):
         old = self.put(self.ubu, "plans/p.md", b"old")
         self.put(self.mac, "plans/q.md", b"created")
         self.send(["cli/plans/p.md", "cli/plans/q.md"], run_id="r1")
-        self.assertEqual(open(old, "rb").read(), b"new")
+        self.assertEqual(read(old), b"new")
         out = self.call(self.ubu, "undo", run_id="r1")
-        self.assertEqual(open(old, "rb").read(), b"old")
+        self.assertEqual(read(old), b"old")
         self.assertFalse(os.path.exists(f"{self.ubu.home}/.claude/plans/q.md"))
         self.assertTrue(out["restored"] and out["removed"])
+
+    def test_undo_restores_the_state_before_the_run(self):
+        # One run can write a key twice (a copy, then a split) and delete others: undo goes back to the start.
+        old = self.put(self.ubu, "plans/p.md", b"old")
+        gone = self.put(self.ubu, "plans/q.md", b"q")
+        self.put(self.mac, "plans/p.md", b"v1")
+        self.send(["cli/plans/p.md"], run_id="r9")
+        self.put(self.mac, "plans/p.md", b"v2")
+        self.send(["cli/plans/p.md"], run_id="r9")
+        self.call(self.ubu, "delete", run_id="r9", keys=["cli/plans/q.md"])
+        self.assertEqual(read(old), b"v2")
+        self.call(self.ubu, "undo", run_id="r9")
+        self.assertEqual((read(old), read(gone)), (b"old", b"q"))
 
     def test_delete_and_undo(self):
         p = self.put(self.ubu, "plans/p.md", b"x")
@@ -114,7 +132,7 @@ class PackApplyUndo(Base):
                          ["cli/plans/p.md"])
         self.assertFalse(os.path.exists(p))
         self.call(self.ubu, "undo", run_id=None)
-        self.assertEqual(open(p, "rb").read(), b"x")
+        self.assertEqual(read(p), b"x")
 
     def test_conflict_member_goes_to_conflicts_folder(self):
         buf = io.BytesIO()
@@ -171,6 +189,18 @@ class Runner(unittest.TestCase):
     def test_info(self):
         info = json.loads(remote.Runner(None).call("info", {}))
         self.assertTrue({"hostname", "home", "desktop", "platform", "app_running", "cli_pids"} <= set(info))
+
+    def test_program_runs_on_the_macs_ssh_python(self):
+        # A non-interactive SSH login on the Mac gets /usr/bin/python3, which is 3.9.
+        py = "/usr/bin/python3"
+        if not os.path.exists(py):
+            self.skipTest("no /usr/bin/python3")
+        code = f"import base64;exec(base64.b64decode('{remote.program()}'))"
+        with tempfile.TemporaryDirectory() as t:
+            args = json.dumps({"home": t, "desktop": t + "/d", "folders": {}})
+            p = subprocess.run([py, "-c", code, "inventory", args], input=b"", capture_output=True,
+                               cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.assertEqual(p.returncode, 0, p.stderr.decode())
 
     def test_error_raises(self):
         with self.assertRaises(remote.RemoteError):

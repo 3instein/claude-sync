@@ -33,5 +33,10 @@ class Runner:
 def program() -> str:
     """The combined base64 program: model.py + paths.py + helper.py source."""
     here = Path(__file__).parent
-    src = "\n".join((here / name).read_text() for name in ("model.py", "paths.py", "helper.py"))
+    # A non-interactive SSH login on the Mac gets /usr/bin/python3 (3.9), so the program
+    # must parse there: postponed annotations make `str | None` legal on 3.9.
+    # The program must not import the claude_sync package from the working folder, which
+    # may hold another version: drop the -c entry ("") from sys.path first.
+    src = "from __future__ import annotations\nimport sys\nsys.path[:] = [p for p in sys.path if p]\n" + "\n".join(
+        (here / name).read_text() for name in ("model.py", "paths.py", "helper.py"))
     return base64.b64encode(src.encode()).decode()

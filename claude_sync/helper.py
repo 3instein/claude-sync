@@ -138,7 +138,8 @@ def _folder_cwd(folder_dir, folder, given_folders, m):
         names = []
     for name in names:
         with open(os.path.join(folder_dir, name), "rb") as fh:
-            cwd = transcript_cwd(fh.read())
+            head = fh.read(1 << 20)
+        cwd = transcript_cwd(head[:head.rfind(b"\n") + 1])
         if cwd:
             return cwd, neutral(cwd, m)
     neutral_cwd = given_folders.get(folder)
@@ -170,14 +171,19 @@ def cmd_inventory(args, stdin):
                 warnings.append(f"no key for {root}/{rel}")
                 continue
             full = os.path.join(base_dir, rel)
-            mtime = int(os.stat(full).st_mtime)
+            st = os.stat(full)
+            mtime = int(st.st_mtime)
+            cached = cache.get(key)
+            # ponytail: a transcript with a partial last line is read each run; its cached size is shorter.
+            if cached and cached[0] == mtime and cached[1] == st.st_size:
+                files[key] = [cached[2], mtime, st.st_size]
+                continue
             with open(full, "rb") as fh:
                 data = fh.read()
             if classify(key) == "transcript":
                 cut = data.rfind(b"\n")
                 data = data[:cut + 1] if cut >= 0 else b""
             size = len(data)
-            cached = cache.get(key)
             if cached and cached[0] == mtime and cached[1] == size:
                 digest = cached[2]
             else:
@@ -209,6 +215,24 @@ def cmd_pack(args, stdin):
     return buf.getvalue()
 
 
+def _load_manifest(backup_dir):
+    p = f"{backup_dir}/manifest.json"
+    return json.loads(open(p, "rb").read()) if os.path.isfile(p) else {}
+
+
+def _backup(target, key, backup_dir, root, manifest):
+    """Record the file as it was before this run. A run can write one key more than once,
+    so only the first call keeps a backup: undo must restore the state before the run."""
+    if key in manifest:
+        return
+    backup_path = None
+    if os.path.exists(target):
+        backup_path = f"{backup_dir}/{key}"
+        _mkdirs_secure(os.path.dirname(backup_path), root)
+        shutil.copy2(target, backup_path)
+    manifest[key] = {"path": target, "backup": backup_path}
+
+
 def cmd_apply(args, stdin):
     dst = Machine("here", args["home"], args["desktop"])
     src = Machine("there", args["src"]["home"], args["src"]["desktop"])
@@ -216,7 +240,7 @@ def cmd_apply(args, stdin):
     root = _cache_root(dst)
     backup_dir = f"{root}/backup/{run_id}"
     _mkdirs_secure(backup_dir, root)
-    written, errors, manifest = {}, [], {}
+    written, errors, manifest = {}, [], _load_manifest(backup_dir)
     with tarfile.open(fileobj=io.BytesIO(stdin), mode="r:gz") as tar:
         for member in tar:
             if not member.isfile():
@@ -232,13 +256,8 @@ def cmd_apply(args, stdin):
                 key = member.name
                 localized = localize_bytes(key, data, src, dst)
                 target = key_to_path(key, dst)
-                backup_path = None
-                if os.path.exists(target):
-                    backup_path = f"{backup_dir}/{key}"
-                    _mkdirs_secure(os.path.dirname(backup_path), root)
-                    shutil.copy2(target, backup_path)
+                _backup(target, key, backup_dir, root, manifest)
                 _atomic_write(target, localized, mtime=member.mtime)
-                manifest[key] = {"path": target, "backup": backup_path}
                 written[key] = [int(member.mtime), len(localized)]
             except Exception as e:
                 errors.append(f"{member.name}: {e}")
@@ -252,19 +271,14 @@ def cmd_delete(args, stdin):
     root = _cache_root(m)
     backup_dir = f"{root}/backup/{run_id}"
     _mkdirs_secure(backup_dir, root)
-    deleted, errors, manifest = [], [], {}
+    deleted, errors, manifest = [], [], _load_manifest(backup_dir)
     for key in args["keys"]:
         try:
             target = key_to_path(key, m)
+            _backup(target, key, backup_dir, root, manifest)
             if os.path.exists(target):
-                backup_path = f"{backup_dir}/{key}"
-                _mkdirs_secure(os.path.dirname(backup_path), root)
-                shutil.copy2(target, backup_path)
                 os.remove(target)
-                manifest[key] = {"path": target, "backup": backup_path}
                 deleted.append(key)
-            else:
-                manifest[key] = {"path": target, "backup": None}
         except Exception as e:
             errors.append(f"{key}: {e}")
     _atomic_write(f"{backup_dir}/manifest.json", json.dumps(manifest).encode())

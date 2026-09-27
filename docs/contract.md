@@ -5,7 +5,7 @@ https://claude.ai/code/artifact/fb6210c4-da47-473c-aef3-c2dadf763388
 
 ## Rules for every agent
 
-- Python 3.12 or later, standard library only. Both machines run 3.14.
+- Standard library only. The cli and merge run on Python 3.12 or later (both machines have 3.14). The helper program (`model.py`, `paths.py`, `helper.py`) must also run on Python 3.9, because a non-interactive SSH login on the Mac gets `/usr/bin/python3` 3.9.6. `remote.program()` adds `from __future__ import annotations`.
 - Never read or write the real `~/.claude`, the real desktop data folder, or `~/.cache/claude-sync`. Never run `ssh`. Tests use temporary folders and the `Machine` values in the tests.
 - Change only the files that your part owns (see the table). `claude_sync/model.py` and this file belong to the orchestrator. If the contract is wrong, stop and say so in your report.
 - `python3 -m unittest discover -s tests` must pass for your test file before you finish.
@@ -141,7 +141,7 @@ Every command takes one JSON object as `argv[1]` with at least `{"home": ..., "d
 | `undo` | `run_id`, or null for the run with the newest manifest | none | `{"restored": [paths], "removed": [paths]}` |
 | `prune` | `days` | none | `{"removed": [run ids]}`: backup runs whose folder mtime is older than `days` |
 
-`apply` details: for each member, map the content from `src` to this machine with `paths.localize_bytes`, find the local path with `paths.key_to_path`, copy an existing file to `~/.cache/claude-sync/backup/<run_id>/` first, write through a temporary file and `os.replace`, set mode 600 and the member's mtime. A member name that starts with `conflicts/` is written under `~/.cache/claude-sync/conflicts/<run_id>/`. Each run keeps `backup/<run_id>/manifest.json` with each path it touched and whether a backup exists, so `undo` can restore or remove it.
+`apply` details: for each member, map the content from `src` to this machine with `paths.localize_bytes`, find the local path with `paths.key_to_path`, copy an existing file to `~/.cache/claude-sync/backup/<run_id>/` first, write through a temporary file and `os.replace`, set mode 600 and the member's mtime. A member name that starts with `conflicts/` is written under `~/.cache/claude-sync/conflicts/<run_id>/`. Each run keeps one `backup/<run_id>/manifest.json` with each path it touched and whether a backup exists, so `undo` can restore or remove it. A run can call `apply` and `delete` more than once and write one key twice: the manifest keeps the first backup of each key, so `undo` returns to the state before the run.
 
 The inventory lists regular files under the phase 1 items (`model.CLI_ITEMS`, `model.DESKTOP_ITEMS`), skips symlinks and `model.SKIP_NAMES`, and reuses a cached hash when mtime and size are the same.
 
