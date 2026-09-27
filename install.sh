@@ -70,7 +70,7 @@ os.makedirs(dir_name, exist_ok=True)
 fd, tmp_path = tempfile.mkstemp(dir=dir_name)
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
     os.chmod(tmp_path, mode)
     os.replace(tmp_path, path)
