@@ -178,6 +178,17 @@ class McpPart(unittest.TestCase):
         self.assertEqual(self.get_claude_json(self.m)["mcpServers"]["t"]["command"], f"{self.m['home']}/nvm/v22/bin/tool")
         self.assertEqual(self.get_claude_json(self.m)["mcpServers"]["t"]["args"], ["b"])
 
+    def test_http_server_gets_no_command_field(self):
+        server = {"type": "http", "url": "https://example.com/mcp"}
+        self.put_claude_json(self.u, {"mcpServers": {"web": dict(server)}}, mtime=2000)
+        self.put_claude_json(self.m, {"mcpServers": {}}, mtime=1000)
+        code, out = self.sync()
+        self.assertEqual([i for i in out["review"]["exec_config"] if i[1].startswith("mcp:")][0][0], "here", out)
+        code, out = self.sync("--confirm", out["token"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.get_claude_json(self.m)["mcpServers"]["web"], server)
+        self.assertEqual(self.get_claude_json(self.u)["mcpServers"]["web"], server)
+
     def test_secret_flag_forms(self):
         from claude_sync import p_mcp
         for args in (["--api-key=sk-live"], ["--access-token", "ghp_x"], ["--client-secret", "cs"]):

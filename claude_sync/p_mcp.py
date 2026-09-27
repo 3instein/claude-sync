@@ -73,6 +73,8 @@ def _basename_if_abs(cmd):
 def _for_merge(server):
     """The server as merge_json sees it: command reduced to its base name, so resolving
     it to a different absolute path per machine is not read as a change."""
+    if "command" not in server:  # an http server has no command; adding one would change it
+        return dict(server)
     return dict(server, command=_basename_if_abs(server.get("command")))
 
 
