@@ -2,6 +2,7 @@
 See docs/contract.md and the PRD."""
 import argparse
 import datetime
+import hashlib
 import io
 import json
 import os
@@ -128,6 +129,8 @@ def run(a) -> int:
         if not applying:
             result["in_sync"] = not plan.actions
             raise Stop(0 if result["in_sync"] or a.cmd == "sync" else 2, result)
+        for r, m in side.values():
+            r.call("state_write", roots(m), json.dumps({**state, "run_id": run_id}).encode())
         execute(plan, resolved, side, inv, state, run_id, ih, result)
         inv2 = inventories(side, state, {"warnings": []})
         new = next_state(state, inv2, mh, mt, run_id, result)
@@ -220,8 +223,11 @@ def inventories(side, state, result) -> dict:
                            json.dumps(cache).encode())
         known |= set(raw[s].get("folders", {}).values())
         warns = raw[s].get("warnings", [])
-        if not any(k.startswith("cli/projects/") for k in raw[s]["files"]):
-            warns = warns + ["no project files found"]
+        # A folder that had files at the last sync and has none now is suspect (moved, symlinked, reinstalled).
+        for prefix, what in (("cli/projects/", "project files"), ("desktop/claude-code-sessions/", "desktop sessions")):
+            if (any(k.startswith(prefix) for k in state["files"])
+                    and not any(k.startswith(prefix) for k in raw[s]["files"])):
+                warns = warns + [f"no {what} found"]
         result["warnings"] += [f"{m.name}: {w}" for w in warns]
         out["warned"][s] = bool(warns)
     for s, (r, m) in side.items():
@@ -235,7 +241,14 @@ def inventories(side, state, result) -> dict:
 def remap_slugs(files: dict, m: Machine, known: set) -> dict:
     """A folder with only memory files gets a [slug] key. If a known cwd names the same
     folder, use the {cwd} key, so both machines agree."""
-    by_folder = {paths.folder_name(paths.localize(nc, m)): paths.localize(nc, m) for nc in known}
+    by_folder, clash = {}, set()
+    for nc in sorted(known):
+        f = paths.folder_name(paths.localize(nc, m))
+        if f in by_folder:
+            clash.add(f)
+        by_folder[f] = paths.localize(nc, m)
+    for f in clash:  # two cwds give one folder name: do not guess
+        del by_folder[f]
     out = {}
     for k, v in files.items():
         if k.startswith("cli/projects/["):
@@ -350,7 +363,7 @@ def resolve_transcripts(plan, side) -> dict:
     prefixes = [[mh.home, mh.desktop], [mt.home, mt.desktop]]
     h, t = pack(hr, mh, keys), pack(tr, mt, keys)
     out = {}
-    for k in keys:
+    for k in [k for k in keys if k in h and k in t]:
         winner = merge.resolve_transcript(paths.normalize_bytes(k, h[k][0], mh, prefixes),
                                           paths.normalize_bytes(k, t[k][0], mt, prefixes))
         out[k] = (winner, h[k], t[k])
@@ -370,6 +383,9 @@ def execute(plan, resolved, side, inv, state, run_id, ih, result):
     both = [a.key for a in plan.actions if a.op in ("json_merge", "conflict")]
     got = {s: pack(*side[s], both) for s in side} if both else {}
     for a in [a for a in plan.actions if a.op in ("json_merge", "conflict")]:
+        if a.key not in got["here"] or a.key not in got["there"]:
+            result["warnings"].append(f"skipped, deleted during the run: {a.key}")
+            continue
         h, t = got["here"][a.key], got["there"][a.key]
         if a.op == "conflict":
             copies["there"].append(a.key)
@@ -411,7 +427,8 @@ def split(key, there_copy, side, inv, run_id, result):
     with its subagent files, rewind checkpoints and Code tab entry."""
     tr, mt = side["there"]
     old_id = os.path.basename(key)[:-len(".jsonl")]
-    new_id = str(uuid.uuid4())
+    # Same copies give the same new id: a run that crashed after the split does not split again.
+    new_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"claude-sync|{key}|{hashlib.sha256(there_copy[0]).hexdigest()}"))
     folder = key[:-len(old_id + ".jsonl")]
     members = {folder + new_id + ".jsonl": (merge.split_transcript(there_copy[0], old_id, new_id), *there_copy[1:])}
     extra = [k for k in inv["there"] if k.startswith((f"{folder}{old_id}/", f"cli/file-history/{old_id}/"))]
@@ -421,7 +438,7 @@ def split(key, there_copy, side, inv, run_id, result):
     for k, (data, mtime, mode) in pack(tr, mt, sessions).items():
         obj = json.loads(data)
         if obj.get("cliSessionId") == old_id:
-            obj.update(sessionId="local_" + str(uuid.uuid4()), cliSessionId=new_id,
+            obj.update(sessionId="local_" + str(uuid.uuid5(uuid.NAMESPACE_URL, new_id)), cliSessionId=new_id,
                        title=f"{obj.get('title', 'Session')} (from {mt.name})")
             members[k.rsplit("/", 1)[0] + "/" + obj["sessionId"] + ".json"] = (json.dumps(obj).encode(), mtime, mode)
     for s in ("there", "here"):
@@ -493,7 +510,13 @@ def undo(a) -> int:
     if not state["run_id"]:
         raise Stop(1, {"host": a.host, "error": "no run to undo", "in_sync": False})
     out = {name: call_json(r, "undo", {**roots(m), "run_id": state["run_id"]}) for name, (r, m) in ms.items()}
-    # ponytail: the state still names the undone run; the next run compares hashes and asks about the differences.
+    # The undone keys leave the state: the next run then sees two different copies with no
+    # last-sync entry and merges them as a conflict, not as a one-sided change.
+    undone = {k for o in out.values() for k in o.get("keys", [])}
+    state["files"] = {k: v for k, v in state["files"].items() if k not in undone}
+    state["base"] = {k: v for k, v in state.get("base", {}).items() if k not in undone}
+    for r, m in ms.values():
+        r.call("state_write", roots(m), json.dumps(state).encode())
     emit(a, {"host": a.host, "run_id": state["run_id"], "undo": out, "in_sync": False})
     return 0
 

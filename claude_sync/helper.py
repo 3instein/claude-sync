@@ -80,7 +80,21 @@ def _expect_mismatch(target, exp):
     if not exists:
         return False
     st = os.stat(target)
-    return [int(st.st_mtime), st.st_size] != list(exp)
+    return [int(st.st_mtime), _full_line_size(target, st.st_size)] != list(exp)
+
+
+def _full_line_size(path, size):
+    """The inventory counts a transcript only up to its last full line, so compare the same way."""
+    if not path.endswith(".jsonl"):
+        return size
+    with open(path, "rb") as f:
+        f.seek(max(0, size - (1 << 20)))
+        tail = f.read()
+        if b"\n" not in tail and size > len(tail):
+            f.seek(0)
+            tail = f.read()
+    cut = tail.rfind(b"\n")
+    return size - len(tail) + cut + 1 if cut >= 0 else 0
 
 
 # --- info -----------------------------------------------------------------------------
@@ -248,12 +262,15 @@ def cmd_pack(args, stdin):
             if not safe_key(key):
                 raise ValueError(f"unsafe key: {key}")
             path = key_to_path(key, m)
-            with open(path, "rb") as f:
-                data = f.read()
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+                st = os.stat(path)
+            except FileNotFoundError:
+                continue  # deleted since the file list; the cli sees it missing and skips the key
             if classify(key) == "transcript":
                 cut = data.rfind(b"\n")
                 data = data[:cut + 1] if cut >= 0 else b""
-            st = os.stat(path)
             info = tarfile.TarInfo(key)
             info.size = len(data)
             info.mtime = int(st.st_mtime)
@@ -394,7 +411,7 @@ def cmd_undo(args, stdin):
         elif exists:
             os.remove(target)
             removed.append(target)
-    return {"restored": restored, "removed": removed, "skipped": skipped}
+    return {"restored": restored, "removed": removed, "skipped": skipped, "keys": sorted(manifest)}
 
 
 def cmd_prune(args, stdin):

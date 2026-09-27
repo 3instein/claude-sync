@@ -164,6 +164,30 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.get(self.m, "plans/p.md"), b"plan", "the Mac file goes back")
         self.assertEqual(self.get(self.u, "plans/p.md"), b"ubuntu v2", "the Ubuntu edit is not touched")
 
+    def test_sync_after_undo_asks_instead_of_reverting(self):
+        self.seed()
+        self.assertEqual(self.sync()[0], 0)
+        self.put(self.m, "plans/p.md", b"mac v2", mtime=OLD + 10)
+        self.assertEqual(self.sync()[0], 0)
+        subprocess.run([sys.executable, f"{REPO}/claude-sync", "undo", "ubu", "--json"], env=self.env, check=True,
+                       capture_output=True)
+        self.assertEqual(self.get(self.u, "plans/p.md"), b"plan")
+        code, out = self.sync()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.get(self.m, "plans/p.md"), b"mac v2", "the Mac edit is not reverted")
+        self.assertIn("cli/plans/p.md", out.get("conflicts", []))
+
+    def test_partial_last_line_does_not_block_updates(self):
+        self.seed()
+        self.assertEqual(self.sync()[0], 0)
+        tu = f"{self.project(self.u)}/s1.jsonl"
+        self.put(self.u, tu, self.get(self.u, tu) + b'{"partial', mtime=OLD)
+        t = f"{self.project(self.m)}/s1.jsonl"
+        self.put(self.m, t, self.get(self.m, t) + b'{"uuid":"2","sessionId":"s1"}\n', mtime=OLD + 10)
+        code, out = self.sync()
+        self.assertEqual(code, 0, out)
+        self.assertIn(b'"uuid":"2"', self.get(self.u, tu))
+
     def test_lock_blocks_a_second_run(self):
         lock = {"host": "mac", "pid": os.getpid(), "run_id": "x",
                 "start": subprocess.run(["ps", "-o", "lstart=", "-p", str(os.getpid())],
