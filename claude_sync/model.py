@@ -7,7 +7,7 @@ ROOTS = ("cli", "desktop")   # cli = ~/.claude, desktop = the desktop data folde
 
 # Phase 1 items under each root. Everything else under a root is out of scope.
 CLI_ITEMS = ("CLAUDE.md", "settings.json", ".i-have-adhd-always", ".ponytail-active",
-             "skills", "agents", "commands", "plans", "projects", "file-history", "uploads")
+             "skills", "agents", "commands", "plans", "projects", "file-history", "uploads", "plugins/data")
 DESKTOP_ITEMS = ("claude-code-sessions", "scratch-workspaces")
 SKIP_NAMES = ("scheduled-tasks.json", ".DS_Store")
 # The desktop app syncs these itself from claude.ai, per machine.

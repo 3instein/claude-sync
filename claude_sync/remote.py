@@ -37,6 +37,9 @@ def program() -> str:
     # must parse there: postponed annotations make `str | None` legal on 3.9.
     # The program must not import the claude_sync package from the working folder, which
     # may hold another version: drop the -c entry ("") from sys.path first.
-    src = "from __future__ import annotations\nimport sys\nsys.path[:] = [p for p in sys.path if p]\n" + "\n".join(
-        (here / name).read_text() for name in ("model.py", "paths.py", "helper.py"))
+    # Part helpers (h_*.py) come after helper.py and add their commands to COMMANDS.
+    names = ["model.py", "paths.py", "helper.py"] + sorted(p.name for p in here.glob("h_*.py"))
+    src = ("from __future__ import annotations\nimport sys\nsys.path[:] = [p for p in sys.path if p]\n"
+           + "\n".join((here / name).read_text() for name in names)
+           + "\nsys.exit(main(sys.argv[1:]))\n")
     return base64.b64encode(src.encode()).decode()

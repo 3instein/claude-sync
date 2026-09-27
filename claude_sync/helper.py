@@ -527,6 +527,3 @@ def main(argv: list) -> int:
         sys.stdout.buffer.write(json.dumps(result).encode())
     return 0
 
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))

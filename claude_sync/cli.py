@@ -2,6 +2,7 @@
 See docs/contract.md and the PRD."""
 import argparse
 import datetime
+import importlib
 import hashlib
 import io
 import json
@@ -15,6 +16,7 @@ import uuid
 
 from claude_sync import groups, merge, paths
 from claude_sync.model import Action, FileInfo, Machine
+from claude_sync.part import Ctx
 from claude_sync.remote import RemoteError, Runner
 
 UTC = datetime.timezone.utc
@@ -29,6 +31,8 @@ LIST_CAP = 20
 BATCH = 500        # keys per helper call: one SSH argument is limited to 128 KB, and stdin keeps memory small
 SPLIT_LIMIT = 10   # more transcript splits than this in one run needs a confirm
 EXPECT = ".claude-sync-expect.json"
+# Phase 2 parts, in run order. A part module that does not exist yet is skipped.
+PART_MODULES = ("p_history", "p_mcp", "p_plugins", "p_git", "p_secrets")
 # Tests only: {"here": info overrides, "<host>": info overrides}. Both sides then run locally.
 TEST_ROOTS = json.loads(os.environ.get("CLAUDE_SYNC_TEST_ROOTS", "null"))
 
@@ -60,6 +64,7 @@ def parse(argv):
     p.add_argument("--all", action="store_true", help="list every file, not the first 20 per list")
     p.add_argument("--confirm")
     p.add_argument("--keep", action="append", default=[])
+    p.add_argument("--skip-repo", action="append", default=[])
     a = p.parse_args(argv)
     a.cmd = cmd
     return a
@@ -120,20 +125,29 @@ def run(a) -> int:
         splits = sorted(k for k, (w, _, _) in resolved.items() if w == "split")
         if len(splits) > SPLIT_LIMIT:
             plan.review["splits"] = [["both", k] for k in splits]
+        ctx = Ctx(side=side, state=state, info={"here": ih, "there": it}, confirm=a.confirm, keep=tuple(a.keep),
+                  skip_repos=tuple(a.skip_repo), applying=applying, run_id=run_id, result=result)
+        part_plans = plan_parts(ctx)
+        for reason, items in ctx.review.items():
+            plan.review[reason] = sorted(plan.review.get(reason, []) + items)
         restop(plan, a.confirm)
         describe(result, plan, a.all)
         result["splits"] = len(splits)
-        result["stopped"] = pre_stops + plan.stops
+        result["stopped"] = pre_stops + plan.stops + ctx.stops
         if result["stopped"]:
             raise Stop(3, result)
         group_plan = plan_groups(side, state, result)
         if not applying:
-            result["in_sync"] = not plan.actions and not group_plan
+            result["in_sync"] = not plan.actions and not group_plan and not any(part_plans.values())
             raise Stop(0 if result["in_sync"] or a.cmd == "sync" else 2, result)
         for r, m in side.values():
             r.call("state_write", roots(m), json.dumps({**state, "run_id": run_id}).encode())
         execute(plan, resolved, side, inv, state, run_id, ih, result)
         write_groups(group_plan, side, run_id, result)
+        for name, part_plan in part_plans.items():
+            if part_plan:
+                parts()[name].apply(ctx, part_plan)
+        result["_parts_state"] = ctx.part_state
         inv2 = inventories(side, state, {"warnings": []})
         new = next_state(state, inv2, mh, mt, run_id, result)
         for s in ("there", "here"):  # the other machine first, see the PRD shared-state rule
@@ -147,6 +161,23 @@ def run(a) -> int:
     finally:
         for r, m in locked:
             r.call("lock_remove", roots(m))
+
+
+def parts() -> dict:
+    out = {}
+    for mod in PART_MODULES:
+        try:
+            m = importlib.import_module(f"claude_sync.{mod}")
+        except ModuleNotFoundError:
+            continue
+        out[m.NAME] = m
+    return out
+
+
+def plan_parts(ctx) -> dict:
+    """Each part's plan (None when that part is in sync). Plans only read."""
+    ctx.result.setdefault("parts", {})
+    return {name: m.plan(ctx) for name, m in parts().items()}
 
 
 def restop(plan, confirm):
@@ -302,8 +333,9 @@ def next_state(old, inv, mh, mt, run_id, result) -> dict:
     base = {k: v for k, v in base.items() if k in files}
     folders = {**old.get("folders", {}), mh.host: inv["folders_here"], mt.host: inv["folders_there"]}
     groups_base = result.pop("_groups_base", old.get("groups_base", {}))
+    parts_state = {**old.get("parts", {}), **result.pop("_parts_state", {})}
     return {"version": 1, "run_id": run_id, "files": files, "folders": folders, "base": base,
-            "groups_base": groups_base}
+            "groups_base": groups_base, "parts": parts_state}
 
 
 # ---------- helper transfers, in batches ----------
