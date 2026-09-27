@@ -62,18 +62,6 @@ def _exec_mode(bits):
     return 0o700 if bits & 0o111 else 0o600
 
 
-def _safe_key(key):
-    """rule 3: paths.safe_key is landing in parallel; this is a self-contained stand-in
-    so the traversal fix does not wait on that merge. Same rule: no empty/./.. segment,
-    no leading slash, no NUL, root must be cli or desktop."""
-    if not key or "\x00" in key or key.startswith("/"):
-        return False
-    parts = key.split("/")
-    if parts[0] not in ("cli", "desktop"):
-        return False
-    return all(p not in ("", ".", "..") for p in parts)
-
-
 def _under_root(path, root):
     # catches a symlink escape that a string-only safe_key check cannot see.
     rp, rroot = os.path.realpath(path), os.path.realpath(root)
@@ -202,13 +190,11 @@ def cmd_inventory(args, stdin):
     m = Machine("here", args["home"], args["desktop"])
     cache = json.loads(stdin.decode()) if stdin else {}
     given_folders = args.get("folders", {})
-    prefixes = args.get("prefixes")  # rule 1: only passed on once paths.normalize_bytes accepts it
+    prefixes = args.get("prefixes", ())  # rule 1: [home, desktop] pairs of all machines
     files, warnings, out_folders, folder_cwd_cache = {}, [], {}, {}
 
     def hash_of(key, data):
-        if prefixes is not None:
-            return hashlib.sha256(normalize_bytes(key, data, m, prefixes=prefixes)).hexdigest()
-        return hashlib.sha256(normalize_bytes(key, data, m)).hexdigest()
+        return hashlib.sha256(normalize_bytes(key, data, m, prefixes=prefixes)).hexdigest()
 
     def handle(root, base_dir, items):
         for rel in _walk_root(base_dir, items, root, warnings):
@@ -259,7 +245,7 @@ def cmd_pack(args, stdin):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w|gz") as tar:
         for key in keys:
-            if not _safe_key(key):
+            if not safe_key(key):
                 raise ValueError(f"unsafe key: {key}")
             path = key_to_path(key, m)
             with open(path, "rb") as f:
@@ -316,7 +302,7 @@ def cmd_apply(args, stdin):
                 mode = _exec_mode(member.mode)  # rule 6
                 if member.name.startswith("conflicts/"):
                     rel = member.name[len("conflicts/"):]
-                    if not _safe_key(rel):  # rule 3
+                    if not safe_key(rel):  # rule 3
                         errors.append(f"{member.name}: unsafe key")
                         continue
                     target = f"{root}/conflicts/{run_id}/{rel}"
@@ -327,7 +313,7 @@ def cmd_apply(args, stdin):
                     _atomic_write(target, data, mtime=member.mtime, mode=mode)
                     continue
                 key = member.name
-                if not _safe_key(key):  # rule 3
+                if not safe_key(key):  # rule 3
                     errors.append(f"{key}: unsafe key")
                     continue
                 target = key_to_path(key, dst)
@@ -360,7 +346,7 @@ def cmd_delete(args, stdin):
     manifest = _load_manifest(backup_dir)
     for key in keys:
         try:
-            if not _safe_key(key):  # rule 3
+            if not safe_key(key):  # rule 3
                 errors.append(f"{key}: unsafe key")
                 continue
             target = key_to_path(key, m)
