@@ -139,7 +139,8 @@ def run(a) -> int:
             raise Stop(3, result)
         group_plan = plan_groups(side, state, result)
         if not applying:
-            result["in_sync"] = not plan.actions and not group_plan and not any(part_plans.values())
+            result["in_sync"] = (not plan.actions and not group_plan and not any(part_plans.values())
+                                 and not any(w.startswith(("skipped", "error")) for w in result["warnings"]))
             raise Stop(0 if result["in_sync"] or a.cmd == "sync" else 2, result)
         for r, m in side.values():
             r.call("state_write", roots(m), json.dumps({**state, "run_id": run_id}).encode())
@@ -194,18 +195,24 @@ def guard_dev(plan, inv, result):
     def inside(key, s):
         path = "~/dev/" + key[len("dev/"):]
         return any(path == r or path.startswith(r.rstrip("/") + "/") for r in inv["dev_repos_" + s])
-    keep = []
+    keep, dropped = [], set()
     for a in plan.actions:
         if a.key.startswith("dev/") and a.op == "delete" and inside(a.key, other[a.to]):
-            result["warnings"].append(f"not deleted, now inside a repo or skipped folder on the other machine: {a.key}")
+            result["warnings"].append(f"note: not deleted, now inside a repo or skipped folder on the other machine: {a.key}")
+            dropped.add((a.to, a.key))
             continue
         if a.key.endswith("/.claude/settings.local.json") and a.key.startswith("dev/") and a.op == "copy":
             repo = "~/dev/" + a.key[len("dev/"):-len("/.claude/settings.local.json")]
-            if repo not in inv["dev_repos_" + a.to]:
-                result["warnings"].append(f"not copied, the repo is not on that machine: {a.key}")
+            # Only a repo's settings wait for the repo; a plain folder's settings sync like any file.
+            if repo in inv["dev_repos_" + other[a.to]] and repo not in inv["dev_repos_" + a.to]:
+                result["warnings"].append(f"note: not copied, the repo is not on that machine yet: {a.key}")
+                dropped.add((a.to, a.key))
                 continue
         keep.append(a)
     plan.actions = keep
+    # A dropped action leaves the review too, or its stop would come back on every run.
+    review = {r: [i for i in items if (i[0], i[1]) not in dropped] for r, items in plan.review.items()}
+    plan.review = {r: items for r, items in review.items() if items}
     dev_del = {(a.to, a.key) for a in keep if a.op == "delete" and a.key.startswith("dev/")}
     if dev_del:
         old = {tuple(i) for i in plan.review.get("deletions", [])}

@@ -12,7 +12,8 @@ NAME = "mcp"
 # A secret by name, unless the value is a path (for example TOKEN_PATH holds a file path).
 NAME_RE = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASS|PAT|AUTH|CREDENTIAL", re.IGNORECASE)
 # A --api-key / --token / --secret / --password / --auth style option, with a value after it.
-FLAG_RE = re.compile(r"^--?(api[-_]?key|token|secret|password|auth)\b", re.IGNORECASE)
+FLAG_RE = re.compile(r"^--?((api[-_]?)?key|token|secret|password|passwd|auth"
+                     r"|(access|client|refresh|auth)[-_]?(token|secret|key))(?P<value>=.+)?$", re.IGNORECASE)
 # scheme://user:pass@host
 URL_AUTH_RE = re.compile(r"[a-zA-Z][\w+.-]*://[^/\s:@]+:[^/\s@]+@")
 # a token=, key= or secret= query value
@@ -40,7 +41,8 @@ def _has_secret(server):
             continue
         if _value_leaks_secret(a):
             return True
-        if FLAG_RE.match(a) and i + 1 < len(args):
+        flag = FLAG_RE.match(a)
+        if flag and (flag.group("value") or i + 1 < len(args)):
             return True
     return _value_leaks_secret(server.get("url"))
 
@@ -99,19 +101,24 @@ def _plan_servers(local_servers, merged, abs_names, skip, r, m, side, result):
                 review.append([side, f"mcp:{name}@{_content_hash({})}"])
             continue
         candidate = merged[name]
-        if name in abs_names:
+        local_cmd = (local_servers.get(name) or {}).get("command")
+        if name in abs_names and _basename_if_abs(local_cmd) == candidate.get("command"):
+            found = local_cmd  # this side's command works here already (for example an nvm npx): keep it
+        elif name in abs_names:
             found = resolved.get(candidate.get("command"))
-            if not found:
+        if name in abs_names and not found:
                 result["warnings"].append(f"skipped on {m.name}: mcp command "
                                           f"'{candidate.get('command')}' for server '{name}' not found")
                 continue
+        if name in abs_names:
             new_local = dict(_map_server(candidate, lambda p: paths.localize(p, m)), command=found)
         else:
             new_local = _map_server(candidate, lambda p: paths.localize(p, m))
         if new_local != local_servers.get(name):
             final[name] = new_local
-            review.append([side, f"mcp:{name}@{_content_hash(candidate)}"])
-            written[name] = candidate
+            shown = _map_server(new_local, lambda p: paths.neutral(p, m))  # the command as written on this side
+            review.append([side, f"mcp:{name}@{_content_hash(shown)}"])
+            written[f"{name} ({m.name})"] = shown
     return final, review, written
 
 
@@ -167,7 +174,7 @@ def plan(ctx):
         if any(c is not None and _has_secret(c) for c in copies):
             secret_names.add(name)
             if neutral_full["here"].get(name) != neutral_full["there"].get(name):
-                ctx.result["warnings"].append(f"skipped: mcp server '{name}' has a secret value, not synced")
+                ctx.result["warnings"].append(f"note: mcp server '{name}' has a secret value, so it is not synced")
 
     abs_names = {n for n, v in {**base_servers, **neutral_full["here"], **neutral_full["there"]}.items()
                  if _is_abs_like(v.get("command"))}

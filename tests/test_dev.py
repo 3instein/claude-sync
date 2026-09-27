@@ -93,6 +93,16 @@ class DevRoot(unittest.TestCase):
         copied = json.loads(self.get(self.u, "myrepo/.claude/settings.local.json"))
         self.assertEqual(copied["permissions"]["allow"], [f"Read({self.u['home']}/dev/**)"])
 
+    def test_settings_in_a_plain_folder_do_not_stop_every_run(self):
+        # A folder that is not a repo: its settings.local.json syncs after one confirm, and the next run is in sync.
+        self.put(self.m, "notes/.claude/settings.local.json", b'{"permissions": {"allow": []}}')
+        code, out = self.sync()
+        self.assertEqual(code, 3, out)
+        code, out = self.sync("--confirm", out["token"])
+        self.assertEqual(code, 0, out)
+        code, out = self.sync("status")
+        self.assertEqual(code, 0, out)
+
     def test_env_file_is_not_synced(self):
         self.put(self.m, "proj/.env", b"SECRET=abc123")
         code, out = self.sync()

@@ -35,7 +35,13 @@ def _run_git(argv, timeout, use_bash_ic=False):
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except OSError:
             pass
-        proc.communicate()  # reap, now that the group is dead
+        try:  # a child outside the group (a credential daemon) can keep the pipes open
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe:
+                    pipe.close()
+            proc.wait(timeout=5)
         return None, "", "timed out"
 
 

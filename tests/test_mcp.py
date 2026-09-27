@@ -128,7 +128,7 @@ class McpPart(unittest.TestCase):
         self.put_claude_json(self.u, {"mcpServers": {"secure": {"command": "run"}}}, mtime=2000)
         code, out = self.sync()
         self.assertEqual(code, 0, out)  # the secret server is excluded from the merge, nothing to confirm
-        self.assertFalse(out["in_sync"], "a warning about an unsynced secret keeps in_sync false")
+        self.assertTrue(any("has a secret value" in w for w in out["warnings"]), out["warnings"])
         self.assertEqual(self.get_claude_json(self.m)["mcpServers"]["secure"], secret_server,
                          "the mac keeps its token even though ubuntu's newer copy lost it")
 
@@ -161,6 +161,29 @@ class McpPart(unittest.TestCase):
         self.assertIn(exists_u, u_projects)
         self.assertNotIn(f"{self.u['home']}/dev/missing", u_projects)
 
+    def test_a_working_command_on_each_side_is_kept(self):
+        # An nvm npx on one machine and a ~/.local/bin npx on the other are both kept as they are.
+        for r, path in ((self.m, "nvm/v22/bin"), (self.u, ".local/bin")):
+            os.makedirs(f"{r['home']}/{path}", exist_ok=True)
+            tool = f"{r['home']}/{path}/tool"
+            with open(tool, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(tool, 0o755)
+        self.put_claude_json(self.m, {"mcpServers": {"t": {"command": f"{self.m['home']}/nvm/v22/bin/tool", "args": ["a"]}}}, mtime=1000)
+        self.put_claude_json(self.u, {"mcpServers": {"t": {"command": f"{self.u['home']}/.local/bin/tool", "args": ["b"]}}}, mtime=2000)
+        code, out = self.sync()
+        if code == 3:
+            code, out = self.sync("--confirm", out["token"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.get_claude_json(self.m)["mcpServers"]["t"]["command"], f"{self.m['home']}/nvm/v22/bin/tool")
+        self.assertEqual(self.get_claude_json(self.m)["mcpServers"]["t"]["args"], ["b"])
+
+    def test_secret_flag_forms(self):
+        from claude_sync import p_mcp
+        for args in (["--api-key=sk-live"], ["--access-token", "ghp_x"], ["--client-secret", "cs"]):
+            self.assertTrue(p_mcp._has_secret({"command": "x", "args": args}), args)
+        self.assertFalse(p_mcp._has_secret({"command": "x", "args": ["--token-file"]}))
+
     def test_review_item_has_a_content_hash_and_result_lists_the_json(self):
         self.put_claude_json(self.m, {"mcpServers": {"tool": {"command": "npx", "args": ["-y", "x"]}}})
         self.put_claude_json(self.u, {})
@@ -170,7 +193,9 @@ class McpPart(unittest.TestCase):
         self.assertTrue(items, out)
         for side, item in items:
             self.assertRegex(item, r"^mcp:[^@]+@[0-9a-f]{8}$", item)
-        self.assertEqual(out["parts"]["mcp"]["mcpServers"]["tool"]["args"], ["-y", "x"])
+        shown = [v for k, v in out["parts"]["mcp"]["mcpServers"].items() if k.startswith("tool (")]
+        self.assertTrue(shown, out["parts"]["mcp"])
+        self.assertEqual(shown[0]["args"], ["-y", "x"])
 
 
 if __name__ == "__main__":
