@@ -80,15 +80,34 @@ def _localize_slug(slug: str, m: "Machine") -> str:
 
 # ---- keys ----
 
+# A cwd can itself contain "{", "}", "[" or "]" (or "%"), which would otherwise be
+# mistaken for the token's own delimiters. Escape them inside a token's content.
+_TOKEN_ESCAPES = (("{", "%7B"), ("}", "%7D"), ("[", "%5B"), ("]", "%5D"))
+
+
+def _escape_token(s: str) -> str:
+    s = s.replace("%", "%25")  # escape literal "%" first, before it appears in an escape
+    for ch, esc in _TOKEN_ESCAPES:
+        s = s.replace(ch, esc)
+    return s
+
+
+def _unescape_token(s: str) -> str:
+    for ch, esc in _TOKEN_ESCAPES:
+        s = s.replace(esc, ch)
+    s = s.replace("%25", "%")  # undo the "%" escape last, after the others are gone
+    return s
+
+
 def key_for(root: str, rel: str, m: "Machine", folder_cwd: str | None) -> str | None:
     """Key for the file at <root dir of m>/<rel>. folder_cwd is the absolute cwd of the
     project folder when rel is under projects/. None when no key is possible."""
     if root == "cli" and rel.startswith("projects/"):
         folder, _, rest = rel[len("projects/"):].partition("/")
         if folder_cwd is not None:
-            token = "{" + neutral(folder_cwd, m) + "}"
+            token = "{" + _escape_token(neutral(folder_cwd, m)) + "}"
         elif len(folder) <= 200:
-            token = "[" + _neutral_slug(folder, m) + "]"
+            token = "[" + _escape_token(_neutral_slug(folder, m)) + "]"
         else:
             return None
         return f"cli/projects/{token}/{rest}"
@@ -96,7 +115,11 @@ def key_for(root: str, rel: str, m: "Machine", folder_cwd: str | None) -> str | 
 
 
 def _split_token(remainder: str) -> tuple[str, str]:
-    """Split "<{...} or [...]>/<rest>" into the token and the rest."""
+    """Split "<{...} or [...]>/<rest>" into the token and the rest.
+
+    Safe because a token's content has its own "{}[]" escaped, so the first
+    unescaped closing character is always the real end of the token.
+    """
     end_char = "}" if remainder.startswith("{") else "]"
     end = remainder.index(end_char)
     token, rest = remainder[:end + 1], remainder[end + 1:]
@@ -106,13 +129,27 @@ def _split_token(remainder: str) -> tuple[str, str]:
 
 
 def _resolve_folder(token: str, m: "Machine") -> str:
+    content = _unescape_token(token[1:-1])
     if token.startswith("{"):
-        return folder_name(localize(token[1:-1], m))
-    return _localize_slug(token[1:-1], m)
+        return folder_name(localize(content, m))
+    return _localize_slug(content, m)
+
+
+def safe_key(key: str) -> bool:
+    """False for a key that could escape its root: empty/"."/".." segments, a
+    leading "/", a NUL, or a root other than cli/desktop."""
+    if "\0" in key:
+        return False
+    segments = key.split("/")
+    if segments[0] not in ("cli", "desktop"):
+        return False
+    return all(seg not in ("", ".", "..") for seg in segments)
 
 
 def key_to_path(key: str, m: "Machine") -> str:
     """Absolute path on m for key."""
+    if not safe_key(key):
+        raise ValueError(f"unsafe key: {key}")
     root, rest = key.split("/", 1)
     base = m.home + "/.claude" if root == "cli" else m.desktop
     if root == "cli" and rest.startswith("projects/"):
@@ -300,19 +337,41 @@ def _map_settings(obj, fn):
 
 # ---- hashes and localization ----
 
-def normalize_bytes(key: str, data: bytes, m: "Machine") -> bytes:
-    """Neutral form of the content, the input of FileInfo.hash."""
+def _loose_neutral(data: bytes, prefixes) -> bytes:
+    """Also fold free text mentioning any machine's home or desktop folder to the
+    same token. The migration rewrote such text outside path fields, so two
+    copies that are otherwise identical can still differ there (see contract).
+    Longest prefix first, so one prefix cannot shadow a longer one that starts
+    the same way.
+    """
+    text = data.decode("utf-8", "surrogateescape")
+    desktops = sorted({d for _, d in prefixes if d}, key=len, reverse=True)
+    homes = sorted({h for h, _ in prefixes if h}, key=len, reverse=True)
+    for d in desktops:
+        text = _scan_replace(text, d, DESKTOP_TOKEN)
+    for h in homes:
+        text = _scan_replace(text, h, HOME_TOKEN)
+    return text.encode("utf-8", "surrogateescape")
+
+
+def normalize_bytes(key: str, data: bytes, m: "Machine", prefixes=()) -> bytes:
+    """Neutral form of the content, the input of FileInfo.hash. `prefixes` is a
+    list of [home, desktop] pairs of all machines, for the loose text pass."""
     kind = classify(key)
     if kind == "raw":
-        return data
-    if kind == "transcript":
-        return _rewrite_transcript(data, lambda p: neutral(p, m))
-    obj = json.loads(data)
-    if kind == "session":
-        obj = _map_session(obj, lambda p: neutral(p, m))
-    elif key == "cli/settings.json":
-        obj = _map_settings(obj, lambda s: _neutral_text(s, m))
-    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        result = data
+    elif kind == "transcript":
+        result = _rewrite_transcript(data, lambda p: neutral(p, m))
+    else:
+        obj = json.loads(data)
+        if kind == "session":
+            obj = _map_session(obj, lambda p: neutral(p, m))
+        elif key == "cli/settings.json":
+            obj = _map_settings(obj, lambda s: _neutral_text(s, m))
+        result = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if prefixes:
+        result = _loose_neutral(result, prefixes)
+    return result
 
 
 def localize_bytes(key: str, data: bytes, src: "Machine", dst: "Machine") -> bytes:

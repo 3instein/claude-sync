@@ -28,7 +28,6 @@ class Opts:
 
 def plan(state_files: dict, here: dict, there: dict, opts: Opts) -> Plan:
     first = not state_files
-    sides = {"here": here, "there": there}
     actions = []
     for key in sorted(state_files.keys() | here.keys() | there.keys()):
         rule = _rule(key, state_files.get(key), here.get(key), there.get(key), first, opts)
@@ -37,7 +36,7 @@ def plan(state_files: dict, here: dict, there: dict, opts: Opts) -> Plan:
 
     # In the first run every delete comes from rule 5, so it is reviewed as first_run.
     deletes = [a for a in actions if a.op == "delete"]
-    counted = [] if first else [a for a in deletes if not _old_transcript(a, sides, opts)]
+    counted = [] if first else deletes
     lists = {
         "deletions": counted if len(counted) > opts.deletion_limit else [],
         "first_run": deletes if first else [],
@@ -70,8 +69,10 @@ def _rule(key, s, h, t, first, opts):
         return None
     side, info = ("here", h) if h is not None else ("there", t)
     host = opts.here_host if side == "here" else opts.there_host
+    if s is not None and (info.hash != s["hash"] or _kept(key, opts.keep)):
+        return "copy", OTHER[side]
     if s is not None:
-        return ("delete", side) if info.hash == s["hash"] else ("copy", OTHER[side])
+        return "delete", side
     if first and _unchanged(info, host, opts) and not _kept(key, opts.keep):
         return "delete", side
     return "copy", OTHER[side]
@@ -98,11 +99,6 @@ def _kept(key, keep):
         if key == p or key.startswith(p + "/") or fnmatchcase(key, pattern):
             return True
     return False
-
-
-def _old_transcript(a, sides, opts):
-    info = sides[a.to][a.key]
-    return paths.classify(a.key) == "transcript" and info.mtime < opts.now - opts.cleanup_days * 86400
 
 
 def _writes_live(a, here, opts):
