@@ -13,7 +13,7 @@ import tarfile
 import time
 import uuid
 
-from claude_sync import merge, paths
+from claude_sync import groups, merge, paths
 from claude_sync.model import Action, FileInfo, Machine
 from claude_sync.remote import RemoteError, Runner
 
@@ -126,12 +126,14 @@ def run(a) -> int:
         result["stopped"] = pre_stops + plan.stops
         if result["stopped"]:
             raise Stop(3, result)
+        group_plan = plan_groups(side, state, result)
         if not applying:
-            result["in_sync"] = not plan.actions
+            result["in_sync"] = not plan.actions and not group_plan
             raise Stop(0 if result["in_sync"] or a.cmd == "sync" else 2, result)
         for r, m in side.values():
             r.call("state_write", roots(m), json.dumps({**state, "run_id": run_id}).encode())
         execute(plan, resolved, side, inv, state, run_id, ih, result)
+        write_groups(group_plan, side, run_id, result)
         inv2 = inventories(side, state, {"warnings": []})
         new = next_state(state, inv2, mh, mt, run_id, result)
         for s in ("there", "here"):  # the other machine first, see the PRD shared-state rule
@@ -299,7 +301,9 @@ def next_state(old, inv, mh, mt, run_id, result) -> dict:
             base[k] = obj
     base = {k: v for k, v in base.items() if k in files}
     folders = {**old.get("folders", {}), mh.host: inv["folders_here"], mt.host: inv["folders_there"]}
-    return {"version": 1, "run_id": run_id, "files": files, "folders": folders, "base": base}
+    groups_base = result.pop("_groups_base", old.get("groups_base", {}))
+    return {"version": 1, "run_id": run_id, "files": files, "folders": folders, "base": base,
+            "groups_base": groups_base}
 
 
 # ---------- helper transfers, in batches ----------
@@ -454,6 +458,44 @@ def split(key, there_copy, side, inv, run_id, result):
     for s in ("there", "here"):  # {}: a split file that exists already may have been continued, so keep it
         apply(*side[s], run_id, mt, members, {}, result)
     result.setdefault("split_sessions", []).append({"from": key, "new": folder + new_id + ".jsonl"})
+
+
+# ---------- sidebar groups ----------
+
+def plan_groups(side, state, result):
+    """None when both machines have the same groups. Otherwise the merged groups and each
+    machine's config, for write_groups."""
+    cfg = {}
+    for s_, (r, m) in side.items():
+        got = pack(r, m, [groups.KEY])
+        if groups.KEY not in got:
+            result["groups"] = f"no desktop config on {m.name}"
+            return None
+        cfg[s_] = (json.loads(got[groups.KEY][0]), got[groups.KEY][1], len(got[groups.KEY][0]))
+    here, there = groups.subtree(cfg["here"][0]), groups.subtree(cfg["there"][0])
+    if here == there:
+        # The base moves only when both machines show the same groups: an open app can write its
+        # old copy back after a sync, and then the next run applies the merge again.
+        result["_groups_base"] = here
+        result["groups"] = "in sync"
+        return None
+    merged = groups.merge(state.get("groups_base", {}), here, there, cfg["here"][1] >= cfg["there"][1])
+    changed = [s_ for s_ in side if groups.subtree(cfg[s_][0]) != merged]
+    result["groups"] = f"differ; the merge changes the groups on {', '.join(side[s_][1].name for s_ in changed)}"
+    return {"merged": merged, "cfg": cfg, "changed": changed}
+
+
+def write_groups(group_plan, side, run_id, result):
+    if not group_plan:
+        return
+    for s_ in group_plan["changed"]:
+        r, m = side[s_]
+        cfg, mtime, size = group_plan["cfg"][s_]
+        data = (json.dumps(groups.put(cfg, group_plan["merged"]), ensure_ascii=False, indent=2) + "\n").encode()
+        # The machine's own config goes back to it, so src is that machine: nothing is mapped.
+        apply(r, m, run_id, m, {groups.KEY: (data, int(time.time()), 0o600)},
+              {groups.KEY: FileInfo("", mtime, size)}, result)
+    result["groups"] = "merged; restart the desktop app to see them"
 
 
 # ---------- output ----------

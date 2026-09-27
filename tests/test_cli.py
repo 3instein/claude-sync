@@ -213,6 +213,28 @@ class EndToEnd(unittest.TestCase):
         self.sync()
         self.assertIn(b'"uuid":"4"', self.get(self.m, x), "the continued split session keeps its new line")
 
+    def test_sidebar_groups_merge_and_keep_other_settings(self):
+        def cfg(r, assign, extra):
+            scope = {"groups": [{"id": "g1", "name": "Work"}], "assignments": assign,
+                     "order": {"g1": list(assign)}}
+            data = {"coworkUserFilesPath": r["home"], "preferences": {"sidebarMode": extra,
+                    "epitaxyPrefs": {"dframe-group-scopes": {"o/a": scope}}}}
+            with open(f"{r['desktop']}/claude_desktop_config.json", "w") as f:
+                json.dump(data, f, indent=2)
+        cfg(self.m, {"code:local_a": "g1"}, "mac")
+        cfg(self.u, {"code:local_b": "g1"}, "ubuntu")
+        code, out = self.sync("status")
+        self.assertEqual(code, 2, out)
+        self.assertEqual(self.sync()[0], 0)
+        for r, extra in ((self.m, "mac"), (self.u, "ubuntu")):
+            with open(f"{r['desktop']}/claude_desktop_config.json") as f:
+                got = json.load(f)
+            scope = got["preferences"]["epitaxyPrefs"]["dframe-group-scopes"]["o/a"]
+            self.assertEqual(scope["assignments"], {"code:local_a": "g1", "code:local_b": "g1"})
+            self.assertEqual((got["coworkUserFilesPath"], got["preferences"]["sidebarMode"]), (r["home"], extra))
+        code, out = self.sync("status")
+        self.assertEqual((code, out["groups"]), (0, "in sync"), out)
+
     def test_lock_blocks_a_second_run(self):
         lock = {"host": "mac", "pid": os.getpid(), "run_id": "x",
                 "start": subprocess.run(["ps", "-o", "lstart=", "-p", str(os.getpid())],
