@@ -13,14 +13,21 @@ except ImportError:  # inside the combined program COMMANDS already exists
 
 RUN_TIMEOUT = 180
 OUTPUT_CAP = 2000
+KNOWN_VERSION = 2
 
 
 def _load(path):
+    """(data, error). data is {} with no error when the file simply doesn't exist yet
+    (a fresh machine); error is set for a file that exists but can't be read or parsed,
+    so the caller never mistakes "broken" for "empty" (a truncated file must not read as
+    zero plugins installed, or a plan would uninstall everything)."""
+    if not os.path.exists(path):
+        return {}, None
     try:
         with open(path, "rb") as f:
-            return json.loads(f.read())
-    except (OSError, ValueError):
-        return {}
+            return json.loads(f.read()), None
+    except (OSError, ValueError) as e:
+        return {}, str(e)
 
 
 def _marketplace_source(entry):
@@ -34,12 +41,17 @@ def _marketplace_source(entry):
 
 def cmd_plugins_read(args, stdin):
     plugins_dir = f"{args['home']}/.claude/plugins"
-    installed_obj = _load(f"{plugins_dir}/installed_plugins.json")
+    installed_obj, error = _load(f"{plugins_dir}/installed_plugins.json")
+    if error is None and installed_obj and installed_obj.get("version", KNOWN_VERSION) != KNOWN_VERSION:
+        error = f"unknown installed_plugins.json version: {installed_obj.get('version')!r}"
+    mkt_obj, mkt_error = _load(f"{plugins_dir}/known_marketplaces.json")
+    error = error or mkt_error
+    if error:
+        return {"error": error}
     plugins = installed_obj.get("plugins", {}) if isinstance(installed_obj, dict) else {}
     installed = sorted(pid for pid, records in plugins.items()
                        if isinstance(records, list)
                        and any(isinstance(r, dict) and r.get("scope") == "user" for r in records))
-    mkt_obj = _load(f"{plugins_dir}/known_marketplaces.json")
     marketplaces = {}
     if isinstance(mkt_obj, dict):
         for name, entry in mkt_obj.items():
@@ -49,11 +61,20 @@ def cmd_plugins_read(args, stdin):
     return {"installed": installed, "marketplaces": marketplaces}
 
 
+def _safe_value(v):
+    """A clone URL, plugin id or marketplace source is content from the other machine: it
+    must never be read as an option by the real CLI's argument parser."""
+    return isinstance(v, str) and v != "" and not v.startswith("-")
+
+
 def _valid_argv(argv):
-    """The four shapes the contract allows: install/uninstall X, marketplace add/remove X."""
-    if len(argv) == 2 and argv[0] in ("install", "uninstall"):
-        return True
-    return len(argv) == 3 and argv[0] == "marketplace" and argv[1] in ("add", "remove")
+    """The four shapes the contract allows, each with `--` before its untrusted value:
+    install/uninstall -- X, marketplace add/remove -- X."""
+    if len(argv) == 3 and argv[0] in ("install", "uninstall") and argv[1] == "--":
+        return _safe_value(argv[2])
+    if len(argv) == 4 and argv[0] == "marketplace" and argv[1] in ("add", "remove") and argv[2] == "--":
+        return _safe_value(argv[3])
+    return False
 
 
 def _plugins_claude_bin(home):

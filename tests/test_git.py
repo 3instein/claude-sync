@@ -6,7 +6,10 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+
+from claude_sync import h_git
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GIT_ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.com",
@@ -147,8 +150,20 @@ class Git(unittest.TestCase):
         self.assertEqual(len(entries), 1, out)
         self.assertEqual(entries[0]["machine"], "ubu")
         expect_path = f"{self.u['home']}/dev/solo"
-        cmd = f"git clone {shlex.quote(bare_dir)} {shlex.quote(expect_path)}"
+        cmd = f"git clone -- {shlex.quote(bare_dir)} {shlex.quote(expect_path)}"
         self.assertEqual(entries[0]["next"], _ssh_next(cmd, "ubu"))
+
+    def test_unsafe_origin_is_skipped_not_cloned(self):
+        # fix round 4: a clone URL is content from the other machine and must never be
+        # readable as an option by the shell command we hand back.
+        path, bare_dir = self._repo_on_mac_only("unsafe")
+        _git("config", "remote.origin.url", "--evil-flag", cwd=path)
+        code, out = self.sync("status")
+        entries = self.by_state(out, "missing")
+        self.assertEqual(len(entries), 1, out)
+        self.assertNotIn("next", entries[0])
+        self.assertNotIn("git", out["stopped"])
+        self.assertTrue(any(w.startswith("skipped:") and "unsafe" in w for w in out["warnings"]), out)
 
     def test_no_remote_is_a_warning_not_a_stop(self):
         self._repo_no_origin(self.m["home"], "norem")
@@ -195,11 +210,78 @@ class Git(unittest.TestCase):
         with open(os.path.join(mac_wt, "d.txt"), "w") as f:
             f.write("new")
         code, out = self.sync("status")
-        uncommitted = [e for e in self.by_state(out, "uncommitted") if e["repo"].endswith(".worktrees/feature")]
-        self.assertEqual(len(uncommitted), 1, out)
-        self.assertEqual(uncommitted[0]["machine"], "here")
+        # a worktree's own entries are separate from its main repo's path...
+        wt_entries = [e for e in self.git_entries(out) if e["repo"].endswith(".worktrees/feature")]
+        self.assertEqual(len(wt_entries), 2, out)
+        # ...and per the fix round, a worktree only ever reports an unpushed branch: the
+        # uncommitted file in it is not itself reported.
+        self.assertEqual({e["state"] for e in wt_entries}, {"unpushed_branch"}, out)
         # the main repo itself, untouched, is not also reported
         self.assertEqual([e for e in self.git_entries(out) if e["repo"].endswith("/wt")], [])
+
+    def test_worktree_only_on_one_machine_is_never_reported_as_missing(self):
+        # fix round 3: a real run proposed cloning worktrees that exist on one machine
+        # only. A worktree is never a "missing" candidate, only ever an unpushed branch.
+        mac_path, ubu_path, bare_dir = self._repo_on_both("solowt")
+        with open(os.path.join(mac_path, ".gitignore"), "w") as f:
+            f.write(".worktrees/\n")
+        _git("add", ".gitignore", cwd=mac_path)
+        _git("commit", "-m", "ignore worktrees", cwd=mac_path)
+        wt_path = os.path.join(mac_path, ".worktrees", "feature")
+        _git("worktree", "add", "-b", "feature", wt_path, cwd=mac_path)  # only on mac
+        code, out = self.sync("status")
+        wt_entries = [e for e in self.git_entries(out) if "feature" in e["repo"]]
+        self.assertEqual({e["state"] for e in wt_entries}, {"unpushed_branch"}, out)
+        self.assertFalse(any(e["state"] == "missing" for e in wt_entries), out)
+        self.assertFalse(any("next" in e for e in wt_entries), out)
+
+    def test_unpushed_worktree_branch_reports_that_state_only(self):
+        mac_path, ubu_path, bare_dir = self._repo_on_both("wtpush")
+        with open(os.path.join(mac_path, ".gitignore"), "w") as f:
+            f.write(".worktrees/\n")
+        _git("add", ".gitignore", cwd=mac_path)
+        _git("commit", "-m", "ignore worktrees", cwd=mac_path)
+        _git("push", cwd=mac_path)
+        _git("pull", "--ff-only", cwd=ubu_path)
+        mac_wt = os.path.join(mac_path, ".worktrees", "feature")
+        ubu_wt = os.path.join(ubu_path, ".worktrees", "feature")
+        _git("worktree", "add", "-b", "feature", mac_wt, cwd=mac_path)
+        _git("worktree", "add", "-b", "feature", ubu_wt, cwd=ubu_path)
+        code, out = self.sync("status")
+        wt_entries = [e for e in self.git_entries(out) if e["repo"].endswith(".worktrees/feature")]
+        self.assertEqual({e["state"] for e in wt_entries}, {"unpushed_branch"}, out)
+        self.assertIn("git", out["stopped"])
+
+
+class HGitRobustness(unittest.TestCase):
+    def test_run_git_kills_the_whole_process_group_on_timeout(self):
+        # fix round 4: subprocess.run(timeout=...) only kills its immediate child, leaving
+        # a git subprocess's own children (ssh, credential helpers, ...) running. _run_git
+        # must kill the whole group instead.
+        with tempfile.TemporaryDirectory() as t:
+            pid_file = os.path.join(t, "pid")
+            script = f"sleep 5 & echo $! > {shlex.quote(pid_file)}; wait"
+            start = time.time()
+            code, out, err = h_git._run_git(["sh", "-c", script], timeout=1)
+            elapsed = time.time() - start
+            self.assertIsNone(code)
+            self.assertEqual(err, "timed out")
+            self.assertLess(elapsed, 4, "the whole call must return promptly, not wait out the sleep")
+            with open(pid_file) as f:
+                child_pid = int(f.read().strip())
+        time.sleep(0.2)
+        with self.assertRaises(ProcessLookupError, msg="the grandchild sleep must have been killed too"):
+            os.kill(child_pid, 0)
+
+    def test_status_timeout_is_a_warning_not_a_crash(self):
+        real_run_git = h_git._run_git
+        h_git._run_git = lambda argv, timeout, use_bash_ic=False: (None, "", "timed out")
+        try:
+            changed, untracked, warning = h_git._status("/nonexistent")
+        finally:
+            h_git._run_git = real_run_git
+        self.assertEqual((changed, untracked), ([], []))
+        self.assertEqual(warning, "git status timed out")
 
 
 if __name__ == "__main__":
