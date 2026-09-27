@@ -84,12 +84,17 @@ class Deletions(unittest.TestCase):
         p = merge.plan({k: st("a") for k in keys}, {k: fi("a") for k in keys}, {}, opts())
         self.assertEqual(p.stops, [])
 
-    def test_old_transcripts_do_not_count(self):
+    def test_old_transcripts_count(self):
         old = NOW - 31 * 86400
         keys = [f"cli/projects/{{~/x}}/s{i}.jsonl" for i in range(60)]
         p = merge.plan({k: st("a") for k in keys}, {k: fi("a", mtime=old) for k in keys}, {}, opts())
-        self.assertEqual(p.stops, [])
-        self.assertEqual(len(p.actions), 60)
+        self.assertEqual(p.stops, ["deletions"])
+        self.assertEqual(len(p.review["deletions"]), 60)
+
+    def test_keep_copies_back_a_deletion(self):
+        k = "cli/plans/keepme.md"
+        p = merge.plan({k: st("a")}, {}, {k: fi("a")}, opts(keep=(k,)))
+        self.assertEqual(acts(p), {("copy", k, "here")})
 
     def test_old_memory_files_still_count(self):
         old = NOW - 31 * 86400
