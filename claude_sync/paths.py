@@ -229,7 +229,7 @@ def _rewrite_transcript(data: bytes, fn) -> bytes:
     For .jsonl input, data may lack a final newline (a partial last line); that line
     is kept as-is if it does not parse, so a cut-off tail never crashes this.
     """
-    text = data.decode("utf-8")
+    text = data.decode("utf-8", "surrogateescape")
     trailing = text.endswith("\n")
     lines = text.split("\n")
     if trailing:
@@ -252,7 +252,7 @@ def _rewrite_transcript(data: bytes, fn) -> bytes:
     result = "\n".join(out)
     if trailing:
         result += "\n"
-    return result.encode("utf-8")
+    return result.encode("utf-8", "surrogateescape")
 
 
 # ---- session fields ----
@@ -274,7 +274,8 @@ def _map_session(obj: dict, fn) -> dict:
 def _scan_replace(text: str, old: str, new: str) -> str:
     if not old:
         return text
-    return re.sub(re.escape(old) + r"(?=/|\Z)", new, text)
+    # Both ends at a boundary: "/Users/r" must not match inside "/x/Users/r" or "/Users/r2".
+    return re.sub(r"(?<![\w.~/-])" + re.escape(old) + r"(?=/|\Z|[^\w.-])", new, text)
 
 
 def _neutral_text(text: str, m: "Machine") -> str:
@@ -326,5 +327,6 @@ def localize_bytes(key: str, data: bytes, src: "Machine", dst: "Machine") -> byt
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if key == "cli/settings.json":
         obj = _map_settings(json.loads(data), lambda s: _localize_text(_neutral_text(s, src), dst))
-        return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        # settings.json is edited by hand, so it keeps the indented form Claude Code writes.
+        return (json.dumps(obj, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     return data  # json kind other than settings.json: no path fields to change
