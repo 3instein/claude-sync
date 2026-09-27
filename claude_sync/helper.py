@@ -183,19 +183,29 @@ def _walk_root(base_dir, items, root, warnings):
                 yield os.path.relpath(full, base_dir).replace(os.sep, "/")
 
 
+def _cwds(data):
+    for line in data.split(b"\n"):
+        if b'"cwd"' in line:
+            cwd = transcript_cwd(line + b"\n")
+            if cwd:
+                yield cwd
+
+
 def _folder_cwd(folder_dir, folder, given_folders, m):
-    """The folder's absolute and neutral cwd, from its first transcript or the folders arg."""
+    """The folder's absolute and neutral cwd. Only a cwd whose folder name is this folder counts:
+    a session moved to another folder keeps its old cwd on its first lines (seen on real data)."""
     try:
         names = sorted(f for f in os.listdir(folder_dir)
                         if f.endswith(".jsonl") and not os.path.islink(os.path.join(folder_dir, f)))
     except OSError:
         names = []
-    for name in names:
-        with open(os.path.join(folder_dir, name), "rb") as fh:
-            head = fh.read(1 << 20)
-        cwd = transcript_cwd(head[:head.rfind(b"\n") + 1])
-        if cwd:
-            return cwd, neutral(cwd, m)
+    for full in (False, True):  # the first 1 MB of each file first, whole files only if needed
+        for name in names:
+            with open(os.path.join(folder_dir, name), "rb") as fh:
+                data = fh.read() if full else fh.read(1 << 20)
+            for cwd in _cwds(data):
+                if folder_name(cwd) == folder:
+                    return cwd, neutral(cwd, m)
     neutral_cwd = given_folders.get(folder)
     if neutral_cwd:
         return localize(neutral_cwd, m), neutral_cwd

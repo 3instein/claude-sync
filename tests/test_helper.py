@@ -76,6 +76,15 @@ class Inventory(Base):
         self.assertIn("cli/projects/[-x-memory-only]/memory/a.md", files)
         self.assertFalse(any(k.startswith(("cli/telemetry", "cli/skills/synced")) or "DS_Store" in k or k.endswith("link") for k in files))
 
+    def test_moved_session_uses_the_folder_cwd(self):
+        # A session moved from a scratch folder keeps the old cwd on its first lines.
+        new_cwd = f"{self.mac.home}/dev/app"
+        lines = (json.dumps({"cwd": f"{self.mac.desktop}/scratch-workspaces/s1"}) + "\n"
+                 + json.dumps({"cwd": new_cwd}) + "\n").encode()
+        self.put(self.mac, f"projects/{paths.folder_name(new_cwd)}/m.jsonl", lines)
+        files = self.call(self.mac, "inventory", folders={})["files"]
+        self.assertIn("cli/projects/{~/dev/app}/m.jsonl", files)
+
     def test_same_hash_on_both_machines(self):
         for m in (self.mac, self.ubu):
             cwd, data = self.transcript(m)
