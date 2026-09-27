@@ -392,7 +392,7 @@ class UndoRequiresRunId(Base):
 
 class Runner(unittest.TestCase):
     def test_program_fits_one_argument(self):
-        self.assertLess(len(remote.program().encode()), 90 * 1024)
+        self.assertLess(len(remote.bootstrap().encode()), 90 * 1024)
 
     def test_info(self):
         info = json.loads(remote.Runner(None).call("info", {}))
@@ -403,7 +403,7 @@ class Runner(unittest.TestCase):
         py = "/usr/bin/python3"
         if not os.path.exists(py):
             self.skipTest("no /usr/bin/python3")
-        code = f"import base64;exec(base64.b64decode('{remote.program()}'))"
+        code = remote.bootstrap()
         with tempfile.TemporaryDirectory() as t:
             args = json.dumps({"home": t, "desktop": t + "/d", "folders": {}})
             p = subprocess.run([py, "-c", code, "inventory", args], input=b"", capture_output=True,
@@ -417,3 +417,21 @@ class Runner(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CombinedProgramNames(unittest.TestCase):
+    def test_no_name_is_defined_twice(self):
+        # The helper files share one namespace in the program, so a second definition silently wins.
+        import ast
+        import glob
+        here = os.path.dirname(remote.__file__)
+        seen, dups = {}, []
+        for f in ["model.py", "paths.py", "helper.py"] + sorted(os.path.basename(p) for p in glob.glob(f"{here}/h_*.py")):
+            for node in ast.parse(read(f"{here}/{f}").decode()).body:
+                names = [node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else [
+                    t.id for t in getattr(node, "targets", []) if isinstance(t, ast.Name)]
+                for n in names:
+                    if n in seen and n not in ("COMMANDS",):
+                        dups.append((n, seen[n], f))
+                    seen.setdefault(n, f)
+        self.assertEqual(dups, [])

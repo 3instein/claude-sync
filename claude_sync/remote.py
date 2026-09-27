@@ -1,5 +1,6 @@
 """Runs helper commands locally or on the other machine over SSH. See docs/contract.md."""
 import base64
+import zlib
 import json
 import shlex
 import subprocess
@@ -18,7 +19,7 @@ class Runner:
         self.host = host
 
     def call(self, command: str, args: dict, stdin: bytes = b"") -> bytes:
-        code = f"import base64;exec(base64.b64decode('{program()}'))"
+        code = bootstrap()
         if self.host is None:
             argv = [sys.executable, "-c", code, command, json.dumps(args)]
         else:
@@ -42,4 +43,10 @@ def program() -> str:
     src = ("from __future__ import annotations\nimport sys\nsys.path[:] = [p for p in sys.path if p]\n"
            + "\n".join((here / name).read_text() for name in names)
            + "\nsys.exit(main(sys.argv[1:]))\n")
-    return base64.b64encode(src.encode()).decode()
+    # zlib keeps the program far below the 128 KB limit of one SSH argument as parts are added.
+    return base64.b64encode(zlib.compress(src.encode(), 9)).decode()
+
+
+def bootstrap() -> str:
+    """The python3 -c code that unpacks and runs program()."""
+    return f"import base64,zlib;exec(zlib.decompress(base64.b64decode('{program()}')))"
