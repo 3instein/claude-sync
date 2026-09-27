@@ -94,6 +94,50 @@ class Kinds(unittest.TestCase):
         self.assertFalse(paths.is_exec("cli/projects/{~/x}/memory/a.md"))
 
 
+class DevRootKeys(unittest.TestCase):
+    def test_key_for_and_key_to_path(self):
+        key = paths.key_for("dev", "proj/notes.md", MAC, None)
+        self.assertEqual(key, "dev/proj/notes.md")
+        self.assertEqual(paths.key_to_path(key, MAC), "/Users/r/dev/proj/notes.md")
+        self.assertEqual(paths.key_to_path(key, UBU), "/home/i/dev/proj/notes.md")
+
+    def test_safe_key_accepts_dev_root(self):
+        self.assertTrue(paths.safe_key("dev/proj/notes.md"))
+        self.assertFalse(paths.safe_key("dev/../../x"))
+
+    def test_classify_and_is_exec_for_settings_local(self):
+        key = "dev/proj/.claude/settings.local.json"
+        self.assertEqual(paths.classify(key), "json")
+        self.assertTrue(paths.is_exec(key))
+
+    def test_other_dev_files_are_raw_and_not_exec(self):
+        key = "dev/proj/src/main.py"
+        self.assertEqual(paths.classify(key), "raw")
+        self.assertFalse(paths.is_exec(key))
+
+    def test_settings_local_json_maps_home_paths(self):
+        key = "dev/proj/.claude/settings.local.json"
+        data = json.dumps({"permissions": {"allow": ["Read(/Users/r/dev/**)"]}}).encode()
+        out = json.loads(paths.localize_bytes(key, data, MAC, UBU))
+        self.assertEqual(out["permissions"]["allow"], ["Read(/home/i/dev/**)"])
+
+
+class IsSecret(unittest.TestCase):
+    def test_matches_the_contract_patterns(self):
+        for name in (".env", ".env.local", "id_rsa", "id_rsa.pub", "id_ed25519",
+                     "server.pem", "app.key", "cert.p12", "token.json",
+                     "client_secret_123.json", "credentials.json", "service_account.json",
+                     "my-sa.json", "my-service-account.json", ".npmrc", ".netrc"):
+            self.assertTrue(paths.is_secret(name), name)
+
+    def test_matches_by_basename_of_a_full_path(self):
+        self.assertTrue(paths.is_secret("/Users/r/dev/proj/.env"))
+
+    def test_non_secret_files(self):
+        for name in ("notes.md", "main.py", "settings.local.json", "package.json"):
+            self.assertFalse(paths.is_secret(name), name)
+
+
 def mac_transcript():
     return "\n".join([
         line({"type": "user", "cwd": "/Users/r/dev/x", "sessionId": "s1",

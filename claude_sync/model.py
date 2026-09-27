@@ -12,6 +12,9 @@ DESKTOP_ITEMS = ("claude-code-sessions", "scratch-workspaces")
 SKIP_NAMES = ("scheduled-tasks.json", ".DS_Store")
 # The desktop app syncs these itself from claude.ai, per machine.
 SKIP_PATHS = ("skills/synced",)
+# Dependency/build folders under ~/dev that the dev root never walks into.
+DEV_SKIP_DIRS = ("node_modules", ".venv", "venv", "__pycache__", "dist", "build",
+                  ".next", ".turbo", "target", ".worktrees", "google-cloud-sdk")
 
 
 @dataclass(frozen=True)
