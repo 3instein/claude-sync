@@ -137,11 +137,11 @@ def _resolve_folder(token: str, m: "Machine") -> str:
 
 def safe_key(key: str) -> bool:
     """False for a key that could escape its root: empty/"."/".." segments, a
-    leading "/", a NUL, or a root other than cli/desktop."""
+    leading "/", a NUL, or a root other than cli/desktop/dev."""
     if "\0" in key:
         return False
     segments = key.split("/")
-    if segments[0] not in ("cli", "desktop"):
+    if segments[0] not in ("cli", "desktop", "dev"):
         return False
     return all(seg not in ("", ".", "..") for seg in segments)
 
@@ -151,7 +151,12 @@ def key_to_path(key: str, m: "Machine") -> str:
     if not safe_key(key):
         raise ValueError(f"unsafe key: {key}")
     root, rest = key.split("/", 1)
-    base = m.home + "/.claude" if root == "cli" else m.desktop
+    if root == "cli":
+        base = m.home + "/.claude"
+    elif root == "dev":
+        base = m.home + "/dev"
+    else:
+        base = m.desktop
     if root == "cli" and rest.startswith("projects/"):
         token, path_rest = _split_token(rest[len("projects/"):])
         folder = _resolve_folder(token, m)
@@ -161,21 +166,42 @@ def key_to_path(key: str, m: "Machine") -> str:
 
 # ---- file kinds ----
 
+def _is_dev_settings_local(key: str) -> bool:
+    return key.startswith("dev/") and key.endswith("/.claude/settings.local.json")
+
+
 def classify(key: str) -> str:
     """transcript | session | json | raw"""
     if key.startswith("cli/projects/") and key.endswith(".jsonl"):
         return "transcript"
     if fnmatch.fnmatch(key, "desktop/claude-code-sessions/*/*/local_*.json"):
         return "session"
-    if key == "cli/settings.json" or fnmatch.fnmatch(key, "desktop/claude-code-sessions/*/*/archived-sessions.idx"):
+    if (key == "cli/settings.json" or _is_dev_settings_local(key)
+            or fnmatch.fnmatch(key, "desktop/claude-code-sessions/*/*/archived-sessions.idx")):
         return "json"
     return "raw"
 
 
 def is_exec(key: str) -> bool:
-    if key == "cli/settings.json":
+    if key == "cli/settings.json" or _is_dev_settings_local(key):
         return True
     return key.startswith(("cli/skills/", "cli/agents/", "cli/commands/"))
+
+
+# ---- secret files: never synced, see docs/contract.md `dev` and `secrets` ----
+
+_SECRET_PATTERNS = (
+    ".env*", "*.pem", "*.key", "*.p12", "id_rsa*", "id_ed25519*", "token.json",
+    "client_secret*.json", "credentials*.json", "service_account*.json",
+    "*-sa.json", "*service-account*.json", ".npmrc", ".netrc",
+)
+
+
+def is_secret(name_or_path: str) -> bool:
+    """True when the file name matches a secret pattern. Matched on the name only,
+    so a full path works the same as a bare file name."""
+    name = name_or_path.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch(name, p) for p in _SECRET_PATTERNS)
 
 
 def transcript_cwd(data: bytes) -> str | None:
@@ -368,7 +394,7 @@ def normalize_bytes(key: str, data: bytes, m: "Machine", prefixes=()) -> bytes:
         obj = json.loads(data)
         if kind == "session":
             obj = _map_session(obj, lambda p: neutral(p, m))
-        elif key == "cli/settings.json":
+        elif key == "cli/settings.json" or _is_dev_settings_local(key):
             obj = _map_settings(obj, lambda s: _neutral_text(s, m))
         result = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     if prefixes:
@@ -386,8 +412,8 @@ def localize_bytes(key: str, data: bytes, src: "Machine", dst: "Machine") -> byt
     if kind == "session":
         obj = _map_session(json.loads(data), lambda p: localize(neutral(p, src), dst))
         return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if key == "cli/settings.json":
+    if key == "cli/settings.json" or _is_dev_settings_local(key):
         obj = _map_settings(json.loads(data), lambda s: _localize_text(_neutral_text(s, src), dst))
         # settings.json is edited by hand, so it keeps the indented form Claude Code writes.
         return (json.dumps(obj, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    return data  # json kind other than settings.json: no path fields to change
+    return data  # json kind other than settings.json/settings.local.json: no path fields to change

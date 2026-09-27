@@ -13,7 +13,7 @@ import tempfile
 import time
 
 try:
-    from claude_sync.model import Machine, CLI_ITEMS, DESKTOP_ITEMS, SKIP_NAMES, SKIP_PATHS
+    from claude_sync.model import Machine, CLI_ITEMS, DESKTOP_ITEMS, SKIP_NAMES, SKIP_PATHS, DEV_SKIP_DIRS
     from claude_sync.paths import *  # noqa: F401,F403
 except ImportError:  # inside the combined program the names already exist
     pass
@@ -69,7 +69,11 @@ def _under_root(path, root):
 
 
 def _key_root_dir(key, m):
-    return f"{m.home}/.claude" if key.startswith("cli/") else m.desktop
+    if key.startswith("cli/"):
+        return f"{m.home}/.claude"
+    if key.startswith("dev/"):
+        return f"{m.home}/dev"
+    return m.desktop
 
 
 def _expect_mismatch(target, exp, key=""):
@@ -160,7 +164,7 @@ def _walk_root(base_dir, items, root, warnings):
         if not os.path.exists(top):
             continue
         if os.path.isfile(top):
-            if item not in SKIP_NAMES:
+            if item not in SKIP_NAMES and not is_secret(item):
                 yield item
             continue
         if not os.access(top, os.R_OK | os.X_OK):
@@ -177,9 +181,46 @@ def _walk_root(base_dir, items, root, warnings):
                            not in SKIP_PATHS]
             for fn in filenames:
                 full = os.path.join(dirpath, fn)
-                if fn in SKIP_NAMES or os.path.islink(full):
+                if fn in SKIP_NAMES or os.path.islink(full) or is_secret(fn):
                     continue
                 yield os.path.relpath(full, base_dir).replace(os.sep, "/")
+
+
+def _is_repo(path):
+    return os.path.isdir(os.path.join(path, ".git"))
+
+
+def _walk_dev(home, warnings):
+    """Yield rel paths (posix separators) of files under <home>/dev to sync: skip git
+    repos entirely except <repo>/.claude/settings.local.json, skip symlinks, secret
+    files and the dependency folders in DEV_SKIP_DIRS."""
+    top = os.path.join(home, "dev")
+    if not os.path.exists(top):
+        return
+    if os.path.islink(top):
+        warnings.append("dev is a symlink, skipped")
+        return
+    if not os.access(top, os.R_OK | os.X_OK):
+        warnings.append("dev is not readable, skipped")
+        return
+
+    def onerror(exc):
+        warnings.append(f"error walking dev: {exc}")
+
+    for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
+        dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+        if _is_repo(dirpath):
+            settings = os.path.join(dirpath, ".claude", "settings.local.json")
+            if os.path.isfile(settings) and not os.path.islink(settings):
+                yield os.path.relpath(settings, top).replace(os.sep, "/")
+            dirnames[:] = []  # a repo's other files are git's job, not ours
+            continue
+        dirnames[:] = [d for d in dirnames if d not in DEV_SKIP_DIRS]
+        for fn in filenames:
+            full = os.path.join(dirpath, fn)
+            if os.path.islink(full) or is_secret(fn):
+                continue
+            yield os.path.relpath(full, top).replace(os.sep, "/")
 
 
 def _cwds(data):
@@ -214,6 +255,24 @@ def _folder_cwd(folder_dir, folder, given_folders, m):
     return None, None
 
 
+def _hash_entry(key, full, cache, hash_of):
+    """[hash, mtime, size] for one file, reusing the cache when mtime and size match."""
+    st = os.stat(full)
+    mtime = int(st.st_mtime)
+    cached = cache.get(key)
+    # ponytail: a transcript with a partial last line is read each run; its cached size is shorter.
+    if cached and cached[0] == mtime and cached[1] == st.st_size:
+        return [cached[2], mtime, st.st_size]
+    with open(full, "rb") as fh:
+        data = fh.read()
+    if classify(key) == "transcript":
+        cut = data.rfind(b"\n")
+        data = data[:cut + 1] if cut >= 0 else b""
+    size = len(data)
+    digest = cached[2] if (cached and cached[0] == mtime and cached[1] == size) else hash_of(key, data)
+    return [digest, mtime, size]
+
+
 def cmd_inventory(args, stdin):
     m = Machine("here", args["home"], args["desktop"])
     cache = json.loads(stdin.decode()) if stdin else {}
@@ -240,28 +299,17 @@ def cmd_inventory(args, stdin):
             if key is None:
                 warnings.append(f"no key for {root}/{rel}")
                 continue
-            full = os.path.join(base_dir, rel)
-            st = os.stat(full)
-            mtime = int(st.st_mtime)
-            cached = cache.get(key)
-            # ponytail: a transcript with a partial last line is read each run; its cached size is shorter.
-            if cached and cached[0] == mtime and cached[1] == st.st_size:
-                files[key] = [cached[2], mtime, st.st_size]
-                continue
-            with open(full, "rb") as fh:
-                data = fh.read()
-            if classify(key) == "transcript":
-                cut = data.rfind(b"\n")
-                data = data[:cut + 1] if cut >= 0 else b""
-            size = len(data)
-            if cached and cached[0] == mtime and cached[1] == size:
-                digest = cached[2]
-            else:
-                digest = hash_of(key, data)
-            files[key] = [digest, mtime, size]
+            files[key] = _hash_entry(key, os.path.join(base_dir, rel), cache, hash_of)
+
+    def handle_dev():
+        dev_dir = os.path.join(m.home, "dev")
+        for rel in _walk_dev(m.home, warnings):
+            key = key_for("dev", rel, m, None)
+            files[key] = _hash_entry(key, os.path.join(dev_dir, rel), cache, hash_of)
 
     handle("cli", f"{m.home}/.claude", CLI_ITEMS)
     handle("desktop", m.desktop, DESKTOP_ITEMS)
+    handle_dev()
     return {"files": files, "folders": out_folders, "warnings": warnings}
 
 
