@@ -36,12 +36,18 @@ def _map_project(entries, fn):
     return out
 
 
+def _sort_key(e):
+    # A line without a timestamp sorts first; mixing None and a number would raise.
+    t = e.get("timestamp")
+    return (0, 0) if t is None else (1, t)
+
+
 def _union(*groups):
     by_id = {}
     for group in groups:
         for e in group:
             by_id.setdefault(_identity(e), e)
-    return sorted(by_id.values(), key=lambda e: (e.get("timestamp") or 0))
+    return sorted(by_id.values(), key=_sort_key)
 
 
 def _dump(entries) -> bytes:
@@ -64,7 +70,8 @@ def plan(ctx):
     write = {}
     for s, m in m_of.items():
         localized = _map_project(merged, lambda p, m=m: paths.localize(p, m))
-        if sorted(localized, key=_identity) != sorted(parsed[s], key=_identity):
+        # Identity, not full equality: a timestamp mixed with None would break a sorted compare.
+        if set(map(_identity, localized)) != set(map(_identity, parsed[s])):
             mtime = packed[s][1] if packed[s] else None
             size = len(packed[s][0]) if packed[s] else None
             write[s] = (_dump(localized), mtime, size)

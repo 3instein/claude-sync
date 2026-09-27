@@ -96,19 +96,19 @@ def _search_dirs(home):
 
 def cmd_which(args, stdin):
     """For each name, the first matching executable in the search dirs, or null.
-    For each path, whether it exists and is executable."""
-    dirs = _search_dirs(args["home"])
+    For each dir, whether it exists (used to check a project's folder on this side)."""
+    search = _search_dirs(args["home"])
     names = {}
     for name in args.get("names", []):
         found = None
-        for d in dirs:
+        for d in search:
             cand = os.path.join(d, name)
             if os.path.isfile(cand) and os.access(cand, os.X_OK):
                 found = cand
                 break
         names[name] = found
-    paths_ = {p: os.path.isfile(p) and os.access(p, os.X_OK) for p in args.get("paths", [])}
-    return {"names": names, "paths": paths_}
+    exist = {d: os.path.isdir(d) for d in args.get("dirs", [])}
+    return {"names": names, "dirs": exist}
 
 
 COMMANDS.update({
