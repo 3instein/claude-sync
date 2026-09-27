@@ -347,10 +347,12 @@ def _loose_neutral(data: bytes, prefixes) -> bytes:
     text = data.decode("utf-8", "surrogateescape")
     desktops = sorted({d for _, d in prefixes if d}, key=len, reverse=True)
     homes = sorted({h for h, _ in prefixes if h}, key=len, reverse=True)
+    # Right boundary only: inside JSON strings a path often follows "\\n" or "file://",
+    # and a left boundary would miss it. This form is used only for hashes.
     for d in desktops:
-        text = _scan_replace(text, d, DESKTOP_TOKEN)
+        text = re.sub(re.escape(d) + r"(?=/|\Z|[^\w.-])", DESKTOP_TOKEN, text)
     for h in homes:
-        text = _scan_replace(text, h, HOME_TOKEN)
+        text = re.sub(re.escape(h) + r"(?=/|\Z|[^\w.-])", HOME_TOKEN, text)
     return text.encode("utf-8", "surrogateescape")
 
 

@@ -242,5 +242,16 @@ class LooseHash(unittest.TestCase):
         self.assertEqual(paths.localize_bytes(key, text, MAC, UBU), text)
 
 
+
+class LooseHashInJsonText(unittest.TestCase):
+    def test_paths_after_escaped_newline_and_file_url(self):
+        # Measured on real data: the migration rewrote paths inside JSON-escaped tool output.
+        key = "cli/projects/{~/x}/s.jsonl"
+        pre = [[MAC.home, MAC.desktop], [UBU.home, UBU.desktop]]
+        mac = b'{"out":"key\\n/Users/r/ac and file:///Users/r/dev/a"}\n'
+        ubu = b'{"out":"key\\n/home/i/ac and file:///home/i/dev/a"}\n'
+        self.assertEqual(paths.normalize_bytes(key, mac, MAC, pre), paths.normalize_bytes(key, ubu, UBU, pre))
+
+
 if __name__ == "__main__":
     unittest.main()
