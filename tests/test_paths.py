@@ -60,9 +60,10 @@ class Keys(unittest.TestCase):
         self.assertEqual(paths.key_to_path(key, UBU), "/home/i/.claude/projects/-home-i-dev-x/memory/a.md")
 
     def test_scratch_folder_slug_uses_desktop_token(self):
+        # "{desktop}" is itself made of "{"/"}", escaped like any other token content.
         folder = paths.folder_name(MAC.desktop + SCRATCH)
         key = paths.key_for("cli", f"projects/{folder}/memory/a.md", MAC, None)
-        self.assertTrue(key.startswith("cli/projects/[{desktop}-scratch-workspaces"), key)
+        self.assertTrue(key.startswith("cli/projects/[%7Bdesktop%7D-scratch-workspaces"), key)
         self.assertEqual(paths.key_to_path(key, UBU),
                          "/home/i/.claude/projects/" + paths.folder_name(UBU.desktop + SCRATCH) + "/memory/a.md")
 
@@ -173,6 +174,72 @@ class PathFields(unittest.TestCase):
     def test_hash_is_sha256_friendly(self):
         n = paths.normalize_bytes(self.KEY, mac_transcript(), MAC)
         self.assertEqual(len(hashlib.sha256(n).hexdigest()), 64)
+
+
+class TokenEscaping(unittest.TestCase):
+    def test_desktop_folder_cwd_round_trips(self):
+        # A Code tab scratch session: cwd is under the desktop folder, whose neutral
+        # form is itself "{desktop}", so the token content has its own "{"/"}".
+        cwd = MAC.desktop + "/x"
+        key = paths.key_for("cli", "projects/ignored/abc.jsonl", MAC, cwd)
+        self.assertEqual(key, "cli/projects/{%7Bdesktop%7D/x}/abc.jsonl")
+        self.assertEqual(paths.key_to_path(key, UBU),
+                          "/home/i/.claude/projects/" + paths.folder_name(UBU.desktop + "/x") + "/abc.jsonl")
+        self.assertEqual(paths.key_to_path(key, MAC),
+                          "/Users/r/.claude/projects/" + paths.folder_name(cwd) + "/abc.jsonl")
+
+    def test_cwd_containing_closing_brace(self):
+        cwd = "/Users/r/dev/weird}x"
+        key = paths.key_for("cli", "projects/ignored/abc.jsonl", MAC, cwd)
+        self.assertEqual(key, "cli/projects/{~/dev/weird%7Dx}/abc.jsonl")
+        self.assertEqual(paths.key_to_path(key, MAC),
+                          "/Users/r/.claude/projects/" + paths.folder_name(cwd) + "/abc.jsonl")
+
+
+class SafeKeys(unittest.TestCase):
+    def test_safe(self):
+        self.assertTrue(paths.safe_key("cli/settings.json"))
+        self.assertTrue(paths.safe_key("cli/projects/{~/dev/x}/abc.jsonl"))
+
+    def test_unsafe(self):
+        self.assertFalse(paths.safe_key("cli/../../x"))
+        self.assertFalse(paths.safe_key("cli/projects/[..]/../../x"))
+        self.assertFalse(paths.safe_key("desktop//x"))
+        self.assertFalse(paths.safe_key(""))
+        self.assertFalse(paths.safe_key("/cli/x"))
+        self.assertFalse(paths.safe_key("opt/x"))
+        self.assertFalse(paths.safe_key("cli/x\0y"))
+
+    def test_key_to_path_rejects_unsafe_key(self):
+        with self.assertRaises(ValueError):
+            paths.key_to_path("cli/../../x", MAC)
+
+
+class LooseHash(unittest.TestCase):
+    PREFIXES = [[MAC.home, MAC.desktop], [UBU.home, UBU.desktop]]
+
+    def test_free_text_home_mentions_hash_the_same(self):
+        # The migration rewrote the home path in free text too, not only in path
+        # fields, so a Mac copy naming "/Users/r" and an Ubuntu copy of the same
+        # line naming "/home/i" must hash the same once both are known prefixes.
+        key = "cli/projects/{~/dev/x}/s1.jsonl"
+        mac_line = line({"type": "user", "cwd": "/Users/r/dev/x",
+                          "message": {"content": "home is /Users/r"}}).encode() + b"\n"
+        ubu_line = line({"type": "user", "cwd": "/home/i/dev/x",
+                          "message": {"content": "home is /home/i"}}).encode() + b"\n"
+        self.assertEqual(paths.normalize_bytes(key, mac_line, MAC, self.PREFIXES),
+                          paths.normalize_bytes(key, ubu_line, UBU, self.PREFIXES))
+
+    def test_default_prefixes_leaves_hash_unchanged(self):
+        key = "cli/projects/{~/x}/memory/ubuntu.md"
+        text = b"Mac home is `/Users/r`. Ubuntu home is `/home/i`.\n"
+        self.assertEqual(paths.normalize_bytes(key, text, MAC), text)
+
+    def test_localize_bytes_does_not_apply_loose_matching(self):
+        # Fix round 1 item 1: written content never changes because of this rule.
+        key = "cli/projects/{~/x}/memory/ubuntu.md"
+        text = b"Mac home is `/Users/r`. Ubuntu home is `/home/i`.\n"
+        self.assertEqual(paths.localize_bytes(key, text, MAC, UBU), text)
 
 
 if __name__ == "__main__":
