@@ -21,6 +21,7 @@ except ImportError:  # inside the combined program the names already exist
 CACHE_REL = ".cache/claude-sync"
 LOCK_NAME = "lock.json"
 STATE_NAME = "state.json"
+EXPECT_MEMBER = ".claude-sync-expect.json"
 
 
 def _cache_root(m):
@@ -54,6 +55,44 @@ def _atomic_write(path, data, mtime=None, mode=0o600):
         if os.path.exists(tmp):
             os.remove(tmp)
         raise
+
+
+def _exec_mode(bits):
+    # rule 6: any execute bit on the source means the copy is written 700, else 600.
+    return 0o700 if bits & 0o111 else 0o600
+
+
+def _safe_key(key):
+    """rule 3: paths.safe_key is landing in parallel; this is a self-contained stand-in
+    so the traversal fix does not wait on that merge. Same rule: no empty/./.. segment,
+    no leading slash, no NUL, root must be cli or desktop."""
+    if not key or "\x00" in key or key.startswith("/"):
+        return False
+    parts = key.split("/")
+    if parts[0] not in ("cli", "desktop"):
+        return False
+    return all(p not in ("", ".", "..") for p in parts)
+
+
+def _under_root(path, root):
+    # catches a symlink escape that a string-only safe_key check cannot see.
+    rp, rroot = os.path.realpath(path), os.path.realpath(root)
+    return rp == rroot or rp.startswith(rroot + os.sep)
+
+
+def _key_root_dir(key, m):
+    return f"{m.home}/.claude" if key.startswith("cli/") else m.desktop
+
+
+def _expect_mismatch(target, exp):
+    """rule 5: skip when the target exists and differs from exp, or exists when exp is null."""
+    exists = os.path.exists(target)
+    if exp is None:
+        return exists
+    if not exists:
+        return False
+    st = os.stat(target)
+    return [int(st.st_mtime), st.st_size] != list(exp)
 
 
 # --- info -----------------------------------------------------------------------------
@@ -108,18 +147,29 @@ def cmd_info(args, stdin):
 
 # --- inventory --------------------------------------------------------------------------
 
-def _walk_root(base_dir, items):
+def _walk_root(base_dir, items, root, warnings):
     """Yield keys' rel path (posix separators) for every regular file under the given
-    phase-1 items, skipping symlinks and SKIP_NAMES."""
+    phase-1 items. A missing item is not a warning (a new machine can lack agents/); a
+    symlinked item, an unreadable folder, or an os.walk error is (rule 7)."""
     for item in items:
         top = os.path.join(base_dir, item)
-        if os.path.islink(top) or not os.path.exists(top):
+        if os.path.islink(top):
+            warnings.append(f"{root}/{item} is a symlink, skipped")
+            continue
+        if not os.path.exists(top):
             continue
         if os.path.isfile(top):
             if item not in SKIP_NAMES:
                 yield item
             continue
-        for dirpath, dirnames, filenames in os.walk(top):
+        if not os.access(top, os.R_OK | os.X_OK):
+            warnings.append(f"{root}/{item} is not readable, skipped")
+            continue
+
+        def onerror(exc, _item=item):
+            warnings.append(f"error walking {root}/{_item}: {exc}")
+
+        for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
             dirnames[:] = [d for d in dirnames
                            if d not in SKIP_NAMES and not os.path.islink(os.path.join(dirpath, d))]
             for fn in filenames:
@@ -152,10 +202,16 @@ def cmd_inventory(args, stdin):
     m = Machine("here", args["home"], args["desktop"])
     cache = json.loads(stdin.decode()) if stdin else {}
     given_folders = args.get("folders", {})
+    prefixes = args.get("prefixes")  # rule 1: only passed on once paths.normalize_bytes accepts it
     files, warnings, out_folders, folder_cwd_cache = {}, [], {}, {}
 
+    def hash_of(key, data):
+        if prefixes is not None:
+            return hashlib.sha256(normalize_bytes(key, data, m, prefixes=prefixes)).hexdigest()
+        return hashlib.sha256(normalize_bytes(key, data, m)).hexdigest()
+
     def handle(root, base_dir, items):
-        for rel in _walk_root(base_dir, items):
+        for rel in _walk_root(base_dir, items, root, warnings):
             folder_cwd = None
             if root == "cli" and rel.startswith("projects/"):
                 parts = rel.split("/", 2)
@@ -187,7 +243,7 @@ def cmd_inventory(args, stdin):
             if cached and cached[0] == mtime and cached[1] == size:
                 digest = cached[2]
             else:
-                digest = hashlib.sha256(normalize_bytes(key, data, m)).hexdigest()
+                digest = hash_of(key, data)
             files[key] = [digest, mtime, size]
 
     handle("cli", f"{m.home}/.claude", CLI_ITEMS)
@@ -199,18 +255,23 @@ def cmd_inventory(args, stdin):
 
 def cmd_pack(args, stdin):
     m = Machine("here", args["home"], args["desktop"])
+    keys = json.loads(stdin)["keys"]  # rule 4: keys travel on stdin, not the ssh argument
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w|gz") as tar:
-        for key in args["keys"]:
+        for key in keys:
+            if not _safe_key(key):
+                raise ValueError(f"unsafe key: {key}")
             path = key_to_path(key, m)
             with open(path, "rb") as f:
                 data = f.read()
             if classify(key) == "transcript":
                 cut = data.rfind(b"\n")
                 data = data[:cut + 1] if cut >= 0 else b""
+            st = os.stat(path)
             info = tarfile.TarInfo(key)
             info.size = len(data)
-            info.mtime = int(os.stat(path).st_mtime)
+            info.mtime = int(st.st_mtime)
+            info.mode = _exec_mode(st.st_mode)  # rule 6
             tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
 
@@ -230,7 +291,7 @@ def _backup(target, key, backup_dir, root, manifest):
         backup_path = f"{backup_dir}/{key}"
         _mkdirs_secure(os.path.dirname(backup_path), root)
         shutil.copy2(target, backup_path)
-    manifest[key] = {"path": target, "backup": backup_path}
+    manifest[key] = {"path": target, "backup": backup_path, "written": None}
 
 
 def cmd_apply(args, stdin):
@@ -240,41 +301,72 @@ def cmd_apply(args, stdin):
     root = _cache_root(dst)
     backup_dir = f"{root}/backup/{run_id}"
     _mkdirs_secure(backup_dir, root)
-    written, errors, manifest = {}, [], _load_manifest(backup_dir)
+    written, errors, skipped = {}, [], []
+    manifest = _load_manifest(backup_dir)
+    expect = {}
     with tarfile.open(fileobj=io.BytesIO(stdin), mode="r:gz") as tar:
-        for member in tar:
+        for i, member in enumerate(tar):
             if not member.isfile():
                 continue
             try:
                 data = tar.extractfile(member).read()
+                if i == 0 and member.name == EXPECT_MEMBER:  # rule 5
+                    expect = json.loads(data) if data else {}
+                    continue
+                mode = _exec_mode(member.mode)  # rule 6
                 if member.name.startswith("conflicts/"):
                     rel = member.name[len("conflicts/"):]
+                    if not _safe_key(rel):  # rule 3
+                        errors.append(f"{member.name}: unsafe key")
+                        continue
                     target = f"{root}/conflicts/{run_id}/{rel}"
+                    if not _under_root(target, f"{root}/conflicts/{run_id}"):
+                        errors.append(f"{member.name}: target escapes its root")
+                        continue
                     _mkdirs_secure(os.path.dirname(target), root)
-                    _atomic_write(target, data, mtime=member.mtime)
+                    _atomic_write(target, data, mtime=member.mtime, mode=mode)
                     continue
                 key = member.name
-                localized = localize_bytes(key, data, src, dst)
+                if not _safe_key(key):  # rule 3
+                    errors.append(f"{key}: unsafe key")
+                    continue
                 target = key_to_path(key, dst)
+                if not _under_root(target, _key_root_dir(key, dst)):
+                    errors.append(f"{key}: target escapes its root")
+                    continue
+                if key in expect and _expect_mismatch(target, expect[key]):  # rule 5
+                    skipped.append(key)
+                    continue
+                localized = localize_bytes(key, data, src, dst)
                 _backup(target, key, backup_dir, root, manifest)
-                _atomic_write(target, localized, mtime=member.mtime)
+                _atomic_write(target, localized, mtime=member.mtime, mode=mode)
+                manifest[key]["written"] = [int(member.mtime), len(localized)]
                 written[key] = [int(member.mtime), len(localized)]
             except Exception as e:
                 errors.append(f"{member.name}: {e}")
     _atomic_write(f"{backup_dir}/manifest.json", json.dumps(manifest).encode())
-    return {"written": written, "errors": errors}
+    return {"written": written, "errors": errors, "skipped": skipped}
 
 
 def cmd_delete(args, stdin):
     m = Machine("here", args["home"], args["desktop"])
     run_id = args["run_id"]
+    payload = json.loads(stdin)  # rule 4: keys (and expect) travel on stdin
+    keys, expect = payload["keys"], payload.get("expect", {})
     root = _cache_root(m)
     backup_dir = f"{root}/backup/{run_id}"
     _mkdirs_secure(backup_dir, root)
-    deleted, errors, manifest = [], [], _load_manifest(backup_dir)
-    for key in args["keys"]:
+    deleted, errors, skipped = [], [], []
+    manifest = _load_manifest(backup_dir)
+    for key in keys:
         try:
+            if not _safe_key(key):  # rule 3
+                errors.append(f"{key}: unsafe key")
+                continue
             target = key_to_path(key, m)
+            if key in expect and _expect_mismatch(target, expect[key]):  # rule 5
+                skipped.append(key)
+                continue
             _backup(target, key, backup_dir, root, manifest)
             if os.path.exists(target):
                 os.remove(target)
@@ -282,36 +374,41 @@ def cmd_delete(args, stdin):
         except Exception as e:
             errors.append(f"{key}: {e}")
     _atomic_write(f"{backup_dir}/manifest.json", json.dumps(manifest).encode())
-    return {"deleted": deleted, "errors": errors}
+    return {"deleted": deleted, "errors": errors, "skipped": skipped}
 
 
 def cmd_undo(args, stdin):
     m = Machine("here", args["home"], args["desktop"])
-    backup_root = f"{_cache_root(m)}/backup"
-    run_id = args.get("run_id")
-    if run_id is None:
-        newest, run_id = None, None
-        if os.path.isdir(backup_root):
-            for rid in os.listdir(backup_root):
-                mf = f"{backup_root}/{rid}/manifest.json"
-                if os.path.isfile(mf) and (newest is None or os.path.getmtime(mf) > newest):
-                    newest, run_id = os.path.getmtime(mf), rid
-    mf_path = f"{backup_root}/{run_id}/manifest.json" if run_id else None
-    if not mf_path or not os.path.isfile(mf_path):
-        return {"restored": [], "removed": []}
+    run_id = args["run_id"]  # rule 9: no more "newest run" fallback
+    root = _cache_root(m)
+    backup_dir = f"{root}/backup/{run_id}"
+    mf_path = f"{backup_dir}/manifest.json"
+    if not os.path.isfile(mf_path):
+        return {"restored": [], "removed": [], "skipped": []}
     manifest = json.loads(open(mf_path, "rb").read())
-    restored, removed = [], []
-    for info in manifest.values():
-        target, backup = info["path"], info["backup"]
+    undo_dir = f"{root}/backup/undo-{run_id}"
+    restored, removed, skipped = [], [], []
+    for key, info in manifest.items():
+        target, backup, wrote = info["path"], info["backup"], info.get("written")
+        exists = os.path.exists(target)
+        current = [int(os.stat(target).st_mtime), os.stat(target).st_size] if exists else None
+        # rule 9: skip a file that changed since the run instead of clobbering the change.
+        if (wrote is None and exists) or (wrote is not None and current != list(wrote)):
+            skipped.append(key)
+            continue
+        if exists:
+            # rule 9: never remove or overwrite without a safety copy of the current file first.
+            safety = f"{undo_dir}/{key}"
+            _mkdirs_secure(os.path.dirname(safety), root)
+            shutil.copy2(target, safety)
         if backup:
             os.makedirs(os.path.dirname(target), exist_ok=True)
             shutil.copy2(backup, target)
-            os.chmod(target, 0o600)
             restored.append(target)
-        elif os.path.exists(target):
+        elif exists:
             os.remove(target)
             removed.append(target)
-    return {"restored": restored, "removed": removed}
+    return {"restored": restored, "removed": removed, "skipped": skipped}
 
 
 def cmd_prune(args, stdin):
@@ -336,10 +433,19 @@ def cmd_lock_read(args, stdin):
 
 
 def cmd_lock_write(args, stdin):
-    root = _cache_root(Machine("here", args["home"], args["desktop"]))
+    m = Machine("here", args["home"], args["desktop"])
+    root = _cache_root(m)
     _mkdirs_secure(root, root)
-    _atomic_write(f"{root}/{LOCK_NAME}", json.dumps(args["lock"]).encode())
-    return {"lock": args["lock"]}
+    path = f"{root}/{LOCK_NAME}"
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)  # rule 8: atomic create
+    except FileExistsError:
+        existing = json.loads(open(path, "rb").read()) if os.path.isfile(path) else None
+        return {"ok": False, "lock": existing}
+    with os.fdopen(fd, "wb") as f:
+        f.write(json.dumps(args["lock"]).encode())
+    os.chmod(path, 0o600)
+    return {"ok": True, "lock": args["lock"]}
 
 
 def cmd_lock_remove(args, stdin):

@@ -36,6 +36,12 @@ class Base(unittest.TestCase):
         self.tmp.cleanup()
 
     def call(self, m, command, stdin=b"", **args):
+        # rule 4: pack and delete read keys (and delete's expect) from stdin, not the args.
+        if command in ("pack", "delete") and "keys" in args:
+            payload = {"keys": args.pop("keys")}
+            if "expect" in args:
+                payload["expect"] = args.pop("expect")
+            stdin = json.dumps(payload).encode()
         out = self.run.call(command, {"home": m.home, "desktop": m.desktop, **args}, stdin)
         return out if command == "pack" else json.loads(out)
 
@@ -131,7 +137,7 @@ class PackApplyUndo(Base):
         self.assertEqual(self.call(self.ubu, "delete", run_id="r2", keys=["cli/plans/p.md"])["deleted"],
                          ["cli/plans/p.md"])
         self.assertFalse(os.path.exists(p))
-        self.call(self.ubu, "undo", run_id=None)
+        self.call(self.ubu, "undo", run_id="r2")  # rule 9: undo now requires an explicit run_id
         self.assertEqual(read(p), b"x")
 
     def test_conflict_member_goes_to_conflicts_folder(self):
@@ -180,6 +186,176 @@ class LockStateProcs(Base):
         os.utime(d, (past, past))
         self.assertEqual(self.call(self.ubu, "prune", days=14)["removed"], ["old"])
         self.assertFalse(os.path.exists(d))
+
+
+class LoosePrefixHash(Base):
+    # rule 1: normalize_bytes(..., prefixes=...) is landing in paths.py in parallel; helper.py
+    # only needs to pass it through, so this test goes red again if paths.py loses that param.
+    def test_prefixes_neutralize_free_text_for_hashing(self):
+        prefixes = [[self.mac.home, self.mac.desktop], [self.ubu.home, self.ubu.desktop]]
+        self.put(self.mac, "plans/note.md", f"see {self.mac.home}/dev/x".encode())
+        self.put(self.ubu, "plans/note.md", f"see {self.ubu.home}/dev/x".encode())
+        a = self.call(self.mac, "inventory", folders={}, prefixes=prefixes)["files"]["cli/plans/note.md"][0]
+        b = self.call(self.ubu, "inventory", folders={}, prefixes=prefixes)["files"]["cli/plans/note.md"][0]
+        self.assertEqual(a, b)
+
+
+class SafeKeys(Base):
+    def test_pack_refuses_traversal_key(self):
+        with self.assertRaises(remote.RemoteError):
+            self.call(self.mac, "pack", keys=["cli/../../x"])
+
+    def test_apply_rejects_traversal_members_and_writes_nothing_outside_home(self):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w|gz") as tar:
+            for name in ("cli/../../x", "cli/projects/[..]/../../x", "conflicts/../../../x"):
+                info = tarfile.TarInfo(name)
+                info.size, info.mtime = 1, MTIME
+                tar.addfile(info, io.BytesIO(b"x"))
+        out = self.call(self.ubu, "apply", stdin=buf.getvalue(), run_id="rt",
+                         src={"home": self.mac.home, "desktop": self.mac.desktop})
+        self.assertEqual(out["written"], {})
+        self.assertEqual(len(out["errors"]), 3)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "x")))
+
+    def test_delete_refuses_traversal_key(self):
+        out = self.call(self.ubu, "delete", run_id="rt2", keys=["cli/../../x"])
+        self.assertEqual(out["deleted"], [])
+        self.assertEqual(len(out["errors"]), 1)
+
+
+class KeysOnStdin(Base):
+    def test_pack_reads_keys_from_stdin_not_args(self):
+        self.put(self.mac, "plans/p.md", b"x")
+        stdin = json.dumps({"keys": ["cli/plans/p.md"]}).encode()
+        tar = self.run.call("pack", {"home": self.mac.home, "desktop": self.mac.desktop}, stdin)
+        with tarfile.open(fileobj=io.BytesIO(tar), mode="r:gz") as t:
+            self.assertEqual(t.getnames(), ["cli/plans/p.md"])
+
+    def test_delete_reads_keys_from_stdin(self):
+        p = self.put(self.ubu, "plans/p.md", b"x")
+        stdin = json.dumps({"keys": ["cli/plans/p.md"]}).encode()
+        out = json.loads(self.run.call(
+            "delete", {"home": self.ubu.home, "desktop": self.ubu.desktop, "run_id": "rd"}, stdin))
+        self.assertEqual(out["deleted"], ["cli/plans/p.md"])
+        self.assertFalse(os.path.exists(p))
+
+
+class ExpectPrecondition(Base):
+    def _expect_tar(self, expect, key, data):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w|gz") as tar:
+            head = json.dumps(expect).encode()
+            info = tarfile.TarInfo(".claude-sync-expect.json")
+            info.size = len(head)
+            tar.addfile(info, io.BytesIO(head))
+            k = tarfile.TarInfo(key)
+            k.size, k.mtime = len(data), MTIME
+            tar.addfile(k, io.BytesIO(data))
+        return buf.getvalue()
+
+    def test_apply_skips_when_target_stat_does_not_match(self):
+        target = self.put(self.ubu, "plans/p.md", b"old")
+        tar = self._expect_tar({"cli/plans/p.md": [MTIME + 999, 999]}, "cli/plans/p.md", b"new")
+        out = self.call(self.ubu, "apply", stdin=tar, run_id="re1",
+                         src={"home": self.mac.home, "desktop": self.mac.desktop})
+        self.assertEqual(out["skipped"], ["cli/plans/p.md"])
+        self.assertEqual(read(target), b"old")
+
+    def test_apply_skips_when_expect_null_but_file_exists(self):
+        target = self.put(self.ubu, "plans/q.md", b"exists")
+        tar = self._expect_tar({"cli/plans/q.md": None}, "cli/plans/q.md", b"incoming")
+        out = self.call(self.ubu, "apply", stdin=tar, run_id="re2",
+                         src={"home": self.mac.home, "desktop": self.mac.desktop})
+        self.assertEqual(out["skipped"], ["cli/plans/q.md"])
+        self.assertEqual(read(target), b"exists")
+
+    def test_delete_skips_via_expect(self):
+        target = self.put(self.ubu, "plans/r.md", b"current")
+        stdin = json.dumps({"keys": ["cli/plans/r.md"], "expect": {"cli/plans/r.md": [1, 1]}}).encode()
+        out = json.loads(self.run.call(
+            "delete", {"home": self.ubu.home, "desktop": self.ubu.desktop, "run_id": "re3"}, stdin))
+        self.assertEqual(out["deleted"], [])
+        self.assertEqual(out["skipped"], ["cli/plans/r.md"])
+        self.assertTrue(os.path.exists(target))
+
+
+class Modes(Base):
+    def test_exec_bit_round_trips_as_700(self):
+        p = self.put(self.mac, "commands/run.sh", b"#!/bin/sh\n")
+        os.chmod(p, 0o755)
+        tar = self.call(self.mac, "pack", keys=["cli/commands/run.sh"])
+        self.call(self.ubu, "apply", stdin=tar, run_id="rm1",
+                  src={"home": self.mac.home, "desktop": self.mac.desktop})
+        target = f"{self.ubu.home}/.claude/commands/run.sh"
+        self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o700)
+
+    def test_non_exec_file_is_still_600(self):
+        self.put(self.mac, "commands/note.md", b"text")
+        tar = self.call(self.mac, "pack", keys=["cli/commands/note.md"])
+        self.call(self.ubu, "apply", stdin=tar, run_id="rm2",
+                  src={"home": self.mac.home, "desktop": self.mac.desktop})
+        target = f"{self.ubu.home}/.claude/commands/note.md"
+        self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o600)
+
+
+class InventoryWarnings(Base):
+    def test_symlinked_item_warns(self):
+        os.symlink("/tmp", f"{self.mac.home}/.claude/skills")
+        out = self.call(self.mac, "inventory", folders={})
+        self.assertTrue(any("skills" in w for w in out["warnings"]))
+
+    def test_unreadable_folder_warns(self):
+        p = f"{self.mac.home}/.claude/agents"
+        os.makedirs(p)
+        os.chmod(p, 0o000)
+        try:
+            out = self.call(self.mac, "inventory", folders={})
+        finally:
+            os.chmod(p, 0o700)
+        self.assertTrue(any("agents" in w for w in out["warnings"]))
+
+    def test_missing_item_is_not_a_warning(self):
+        out = self.call(self.mac, "inventory", folders={})
+        self.assertEqual(out["warnings"], [])
+
+
+class AtomicLock(Base):
+    def test_lock_write_refuses_when_a_lock_exists(self):
+        lock1 = {"host": "mac", "pid": 1, "start": "x", "run_id": "a"}
+        out1 = self.call(self.mac, "lock_write", lock=lock1)
+        self.assertEqual(out1, {"ok": True, "lock": lock1})
+        out2 = self.call(self.mac, "lock_write", lock={"host": "ubu", "pid": 2, "start": "y", "run_id": "b"})
+        self.assertEqual(out2, {"ok": False, "lock": lock1})
+
+
+class UndoRequiresRunId(Base):
+    def test_undo_without_run_id_errors(self):
+        with self.assertRaises(remote.RemoteError):
+            self.run.call("undo", {"home": self.mac.home, "desktop": self.mac.desktop})
+
+    def test_undo_skips_a_file_changed_since_the_run(self):
+        old = self.put(self.ubu, "plans/p.md", b"old")
+        self.put(self.mac, "plans/p.md", b"new")
+        tar = self.call(self.mac, "pack", keys=["cli/plans/p.md"])
+        self.call(self.ubu, "apply", stdin=tar, run_id="ru1",
+                  src={"home": self.mac.home, "desktop": self.mac.desktop})
+        with open(old, "wb") as f:  # someone edits the file after the run, before undo
+            f.write(b"edited-after-run")
+        out = self.call(self.ubu, "undo", run_id="ru1")
+        self.assertEqual(out["skipped"], ["cli/plans/p.md"])
+        self.assertEqual(read(old), b"edited-after-run")
+
+    def test_undo_backs_up_the_current_file_before_removing_it(self):
+        self.put(self.mac, "plans/new.md", b"created")
+        tar = self.call(self.mac, "pack", keys=["cli/plans/new.md"])
+        self.call(self.ubu, "apply", stdin=tar, run_id="ru2",
+                  src={"home": self.mac.home, "desktop": self.mac.desktop})
+        target = f"{self.ubu.home}/.claude/plans/new.md"
+        self.call(self.ubu, "undo", run_id="ru2")
+        self.assertFalse(os.path.exists(target))
+        safety = f"{self.ubu.home}/.cache/claude-sync/backup/undo-ru2/cli/plans/new.md"
+        self.assertEqual(read(safety), b"created")
 
 
 class Runner(unittest.TestCase):
