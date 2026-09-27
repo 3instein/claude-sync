@@ -72,7 +72,7 @@ def _key_root_dir(key, m):
     return f"{m.home}/.claude" if key.startswith("cli/") else m.desktop
 
 
-def _expect_mismatch(target, exp):
+def _expect_mismatch(target, exp, key=""):
     """rule 5: skip when the target exists and differs from exp, or exists when exp is null."""
     exists = os.path.exists(target)
     if exp is None:
@@ -80,13 +80,12 @@ def _expect_mismatch(target, exp):
     if not exists:
         return False
     st = os.stat(target)
-    return [int(st.st_mtime), _full_line_size(target, st.st_size)] != list(exp)
+    size = _full_line_size(target, st.st_size) if classify(key) == "transcript" else st.st_size
+    return [int(st.st_mtime), size] != list(exp)
 
 
 def _full_line_size(path, size):
     """The inventory counts a transcript only up to its last full line, so compare the same way."""
-    if not path.endswith(".jsonl"):
-        return size
     with open(path, "rb") as f:
         f.seek(max(0, size - (1 << 20)))
         tail = f.read()
@@ -199,6 +198,9 @@ def _folder_cwd(folder_dir, folder, given_folders, m):
                         if f.endswith(".jsonl") and not os.path.islink(os.path.join(folder_dir, f)))
     except OSError:
         names = []
+    known = given_folders.get(folder)
+    if known and folder_name(localize(known, m)) == folder:  # the state's cwd keeps the key stable
+        return localize(known, m), known
     for full in (False, True):  # the first 1 MB of each file first, whole files only if needed
         for name in names:
             with open(os.path.join(folder_dir, name), "rb") as fh:
@@ -349,7 +351,7 @@ def cmd_apply(args, stdin):
                 if not _under_root(target, _key_root_dir(key, dst)):
                     errors.append(f"{key}: target escapes its root")
                     continue
-                if key in expect and _expect_mismatch(target, expect[key]):  # rule 5
+                if key in expect and _expect_mismatch(target, expect[key], key):  # rule 5
                     skipped.append(key)
                     continue
                 localized = localize_bytes(key, data, src, dst)
@@ -379,7 +381,7 @@ def cmd_delete(args, stdin):
                 errors.append(f"{key}: unsafe key")
                 continue
             target = key_to_path(key, m)
-            if key in expect and _expect_mismatch(target, expect[key]):  # rule 5
+            if key in expect and _expect_mismatch(target, expect[key], key):  # rule 5
                 skipped.append(key)
                 continue
             _backup(target, key, backup_dir, root, manifest)

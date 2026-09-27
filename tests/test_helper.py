@@ -85,6 +85,13 @@ class Inventory(Base):
         files = self.call(self.mac, "inventory", folders={})["files"]
         self.assertIn("cli/projects/{~/dev/app}/m.jsonl", files)
 
+    def test_known_cwd_keeps_the_folder_key(self):
+        # ~/dev/my-app and ~/dev/my.app share one folder name; the state's cwd must win over a new session.
+        folder = paths.folder_name(f"{self.mac.home}/dev/my-app")
+        self.put(self.mac, f"projects/{folder}/a.jsonl", (json.dumps({"cwd": f"{self.mac.home}/dev/my.app"}) + "\n").encode())
+        files = self.call(self.mac, "inventory", folders={folder: "~/dev/my-app"})["files"]
+        self.assertIn("cli/projects/{~/dev/my-app}/a.jsonl", files)
+
     def test_same_hash_on_both_machines(self):
         for m in (self.mac, self.ubu):
             cwd, data = self.transcript(m)
@@ -149,6 +156,21 @@ class PackApplyUndo(Base):
         self.assertFalse(os.path.exists(p))
         self.call(self.ubu, "undo", run_id="r2")  # rule 9: undo now requires an explicit run_id
         self.assertEqual(read(p), b"x")
+
+    def test_jsonl_outside_projects_uses_full_size(self):
+        self.put(self.mac, "plans/d.jsonl", b'{"a":1}\n{"b"', mtime=MTIME + 5)
+        self.put(self.ubu, "plans/d.jsonl", b"old", mtime=MTIME)
+        size = os.path.getsize(f"{self.ubu.home}/.claude/plans/d.jsonl")
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w|gz") as tar:
+            for name, data in ((".claude-sync-expect.json", json.dumps({"cli/plans/d.jsonl": [MTIME, size]}).encode()),
+                               ("cli/plans/d.jsonl", b"new")):
+                info = tarfile.TarInfo(name)
+                info.size, info.mtime = len(data), MTIME + 5
+                tar.addfile(info, io.BytesIO(data))
+        out = self.call(self.ubu, "apply", stdin=buf.getvalue(), run_id="r7",
+                        src={"home": self.mac.home, "desktop": self.mac.desktop})
+        self.assertEqual(out.get("skipped", []), [])
 
     def test_conflict_member_goes_to_conflicts_folder(self):
         buf = io.BytesIO()

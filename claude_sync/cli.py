@@ -218,7 +218,8 @@ def inventories(side, state, result) -> dict:
     raw = {}
     for s, (r, m) in side.items():
         cache = {k: [*e["stat"][m.host], e["hash"]] for k, e in state["files"].items() if m.host in e.get("stat", {})}
-        given = {paths.folder_name(paths.localize(nc, m)): nc for nc in known}
+        given = {paths.folder_name(paths.localize(nc, m)): nc for nc in sorted(known)}
+        given.update(state["folders"].get(m.host, {}))  # this machine's own last-sync cwd wins a name clash
         raw[s] = call_json(r, "inventory", {**roots(m), "folders": given, "prefixes": prefixes},
                            json.dumps(cache).encode())
         known |= set(raw[s].get("folders", {}).values())
@@ -395,8 +396,10 @@ def execute(plan, resolved, side, inv, state, run_id, ih, result):
             continue
         h, t = got["here"][a.key], got["there"][a.key]
         if a.op == "conflict":
-            copies["there"].append(a.key)
-            apply(*side["here"], run_id, side["there"][1], {"conflicts/" + a.key: t}, {}, result)
+            # The newer copy wins, so a sync after undo cannot put an older copy back.
+            winner, loser, loser_m = ("here", t, side["there"][1]) if h[1] >= t[1] else ("there", h, side["here"][1])
+            copies[other[winner]].append(a.key)
+            apply(*side["here"], run_id, loser_m, {"conflicts/" + a.key: loser}, {}, result)
             result.setdefault("conflicts", []).append(a.key)
             continue
         neutral = {s: json.loads(paths.normalize_bytes(a.key, v[a.key][0], side[s][1])) for s, v in got.items()}
@@ -448,8 +451,8 @@ def split(key, there_copy, side, inv, run_id, result):
             obj.update(sessionId="local_" + str(uuid.uuid5(uuid.NAMESPACE_URL, new_id)), cliSessionId=new_id,
                        title=f"{obj.get('title', 'Session')} (from {mt.name})")
             members[k.rsplit("/", 1)[0] + "/" + obj["sessionId"] + ".json"] = (json.dumps(obj).encode(), mtime, mode)
-    for s in ("there", "here"):
-        apply(*side[s], run_id, mt, members, inv[s], result)
+    for s in ("there", "here"):  # {}: a split file that exists already may have been continued, so keep it
+        apply(*side[s], run_id, mt, members, {}, result)
     result.setdefault("split_sessions", []).append({"from": key, "new": folder + new_id + ".jsonl"})
 
 

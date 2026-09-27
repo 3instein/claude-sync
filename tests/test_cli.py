@@ -88,7 +88,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(self.get(self.m, "plans/p.md"), b"edited on ubuntu")
         self.assertFalse(os.path.exists(f"{self.u['home']}/.claude/{self.project(self.u)}/memory/note.md"))
-        self.assertEqual(self.get(self.u, "CLAUDE.md"), b"mac", "this machine's copy wins a raw conflict")
+        self.assertEqual(self.get(self.m, "CLAUDE.md"), b"ubuntu", "the newer copy wins a raw conflict")
         self.assertEqual(out.get("conflicts"), ["cli/CLAUDE.md"])
         self.assertEqual(len(out.get("split_sessions", [])), 1)
         new = os.path.basename(out["split_sessions"][0]["new"])
@@ -187,6 +187,31 @@ class EndToEnd(unittest.TestCase):
         code, out = self.sync()
         self.assertEqual(code, 0, out)
         self.assertIn(b'"uuid":"2"', self.get(self.u, tu))
+
+    def test_undo_then_sync_keeps_the_other_machines_edit(self):
+        self.seed()
+        self.assertEqual(self.sync()[0], 0)
+        self.put(self.u, "plans/p.md", b"ubuntu v2", mtime=OLD + 10)
+        self.assertEqual(self.sync()[0], 0)
+        subprocess.run([sys.executable, f"{REPO}/claude-sync", "undo", "ubu", "--json"], env=self.env, check=True,
+                       capture_output=True)
+        self.assertEqual(self.sync()[0], 0)
+        self.assertEqual((self.get(self.m, "plans/p.md"), self.get(self.u, "plans/p.md")), (b"ubuntu v2", b"ubuntu v2"))
+
+    def test_split_session_that_was_continued_is_not_overwritten(self):
+        self.seed()
+        self.assertEqual(self.sync()[0], 0)
+        t, tu = f"{self.project(self.m)}/s1.jsonl", f"{self.project(self.u)}/s1.jsonl"
+        self.put(self.m, t, self.get(self.m, t) + b'{"uuid":"2","sessionId":"s1"}\n', mtime=OLD + 10)
+        self.put(self.u, tu, self.get(self.u, tu) + b'{"uuid":"3","sessionId":"s1"}\n', mtime=OLD + 10)
+        code, out = self.sync()
+        new = os.path.basename(out["split_sessions"][0]["new"])
+        x = f"{self.project(self.m)}/{new}"
+        self.put(self.m, x, self.get(self.m, x) + b'{"uuid":"4","sessionId":"x"}\n', mtime=OLD + 20)
+        subprocess.run([sys.executable, f"{REPO}/claude-sync", "undo", "ubu", "--json"], env=self.env, check=True,
+                       capture_output=True)
+        self.sync()
+        self.assertIn(b'"uuid":"4"', self.get(self.m, x), "the continued split session keeps its new line")
 
     def test_lock_blocks_a_second_run(self):
         lock = {"host": "mac", "pid": os.getpid(), "run_id": "x",
