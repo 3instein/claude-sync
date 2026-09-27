@@ -22,12 +22,14 @@ FIRST_RUN_CUTOFF = {
     "Darwin": int(datetime.datetime(2026, 9, 23, 15, 22, 30, tzinfo=UTC).timestamp()),
     "Linux": int(datetime.datetime(2026, 9, 23, 15, 22, 31, tzinfo=UTC).timestamp()),
 }
-NEUTRAL = {"home": "~", "desktop": "{desktop}"}  # src for content that is already in neutral form
-NEUTRAL_M = Machine("neutral", "~", "{desktop}")
+NEUTRAL_M = Machine("neutral", "~", "{desktop}")  # src for content that is already in neutral form
 JSON_KINDS = ("session", "json")
+LIST_CAP = 20
+BATCH = 500        # keys per helper call: one SSH argument is limited to 128 KB, and stdin keeps memory small
+SPLIT_LIMIT = 10   # more transcript splits than this in one run needs a confirm
+EXPECT = ".claude-sync-expect.json"
 # Tests only: {"here": info overrides, "<host>": info overrides}. Both sides then run locally.
 TEST_ROOTS = json.loads(os.environ.get("CLAUDE_SYNC_TEST_ROOTS", "null"))
-LIST_CAP = 20
 
 
 class Stop(Exception):
@@ -38,11 +40,10 @@ class Stop(Exception):
 def main(argv=None) -> int:
     a = parse(argv)
     try:
-        if a.cmd == "undo":
-            return undo(a)
-        if a.cmd == "unlock":
-            return unlock(a)
-        return run(a)
+        try:
+            return {"undo": undo, "unlock": unlock}.get(a.cmd, run)(a)
+        except RemoteError as e:
+            raise Stop(1, {"host": a.host, "error": str(e).strip()[-800:], "in_sync": False})
     except Stop as s:
         emit(a, s.result)
         return s.code
@@ -63,8 +64,6 @@ def parse(argv):
     return a
 
 
-# ---------- one run ----------
-
 def runner(host):
     return Runner(None if TEST_ROOTS or host is None else host)
 
@@ -74,78 +73,8 @@ def info(r, name) -> dict:
     return {**out, **TEST_ROOTS[name]} if TEST_ROOTS else out
 
 
-def run(a) -> int:
-    here, there = runner(None), runner(a.host)
-    ih = info(here, "here")
-    try:
-        it = info(there, a.host)
-    except RemoteError as e:
-        raise Stop(4, {"host": a.host, "error": f"not reachable: {str(e).strip()[-300:]}"})
-    mh, mt = machine("here", ih), machine(a.host, it)
-    result = {"host": a.host, "in_sync": False, "stopped": [], "warnings": []}
-    if ih.get("claude_version") != it.get("claude_version"):
-        result["warnings"].append(f"Claude Code versions differ: {ih.get('claude_version')} here, "
-                                  f"{it.get('claude_version')} on {a.host}")
-    pre_stops = [r for r, bad in (("app_open", it.get("app_running")), ("session_open", it.get("cli_pids"))) if bad]
-
-    applying = a.cmd == "sync" and not a.dry_run
-    run_id = datetime.datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ-") + secrets.token_hex(2)
-    locked = []
-    try:
-        if applying:
-            locked = take_locks(here, there, mh, mt, run_id)
-        state = newest_state(here, there, mh, mt)
-        inv_h, fold_h, warn_h = inventory(here, mh, state)
-        inv_t, fold_t, warn_t = inventory(there, mt, state)
-        result["warnings"] += warn_h + [f"{a.host}: {w}" for w in warn_t]
-        opts = merge.Opts(here_host=mh.host, there_host=mt.host, now=int(time.time()),
-                          first_run_cutoff={mh.host: FIRST_RUN_CUTOFF.get(ih["platform"], 0),
-                                            mt.host: FIRST_RUN_CUTOFF.get(it["platform"], 0)},
-                          confirm=a.confirm, keep=tuple(a.keep))
-        plan = merge.plan(state["files"], inv_h, inv_t, opts)
-        plan = drop_suspect_deletes(plan, bool(warn_h), bool(warn_t), a.confirm, result)
-        describe(result, plan, a.all)
-        result["stopped"] = pre_stops + plan.stops
-        if result["stopped"]:
-            raise Stop(3, result)
-        if not applying:
-            result["in_sync"] = not plan.actions
-            raise Stop(0 if result["in_sync"] or a.cmd == "sync" else 2, result)
-        execute(plan, here, there, mh, mt, state, run_id, ih, result)
-        inv_h, fold_h, _ = inventory(here, mh, state)
-        inv_t, fold_t, _ = inventory(there, mt, state)
-        new = next_state(state, inv_h, inv_t, mh, mt, fold_h, fold_t, run_id, result)
-        for r in (there, here):  # the other machine first, see the PRD shared-state rule
-            r.call("state_write", roots(r is here and mh or mt), json.dumps(new).encode())
-        for r, m in ((here, mh), (there, mt)):
-            r.call("prune", {**roots(m), "days": 14})
-        result["run_id"] = run_id
-        result["in_sync"] = True
-        raise Stop(0, result)
-    finally:
-        for r, m in locked:
-            r.call("lock_remove", roots(m))
-
-
-def drop_suspect_deletes(plan, warn_here, warn_there, confirm, result):
-    """A file missing from a side whose file list had warnings may only be unreadable there,
-    so it is not deleted on the other side."""
-    suspect = {"here": warn_there, "there": warn_here}  # a delete on here means: missing there
-    dropped = [a for a in plan.actions if a.op == "delete" and suspect[a.to]]
-    if not dropped:
-        return plan
-    result["warnings"].append(f"{len(dropped)} deletions skipped: the other file list had warnings")
-    gone = {(a.to, a.key) for a in dropped}
-    plan.actions = [a for a in plan.actions if a not in dropped]
-    review = {r: [i for i in items if (i[0], i[1]) not in gone] for r, items in plan.review.items()}
-    plan.review = {r: items for r, items in review.items() if items}
-    plan.token = merge.review_token(plan.review)
-    plan.stops = [r for r in merge.STOP_ORDER if r in plan.review and confirm != plan.token]
-    return plan
-
-
-def machine(name, info):
-    return Machine(name, info["home"], info["desktop"], info["hostname"])
+def machine(name, inf):
+    return Machine(name, inf["home"], inf["desktop"], inf["hostname"])
 
 
 def roots(m: Machine) -> dict:
@@ -154,6 +83,84 @@ def roots(m: Machine) -> dict:
 
 def call_json(r: Runner, cmd: str, args: dict, stdin: bytes = b"") -> dict:
     return json.loads(r.call(cmd, args, stdin))
+
+
+# ---------- one run ----------
+
+def run(a) -> int:
+    here, there = runner(None), runner(a.host)
+    ih = info(here, "here")
+    try:
+        it = info(there, a.host)
+    except RemoteError as e:
+        raise Stop(4, {"host": a.host, "error": f"not reachable: {str(e).strip()[-300:]}", "in_sync": False})
+    mh, mt = machine("here", ih), machine(a.host, it)
+    side = {"here": (here, mh), "there": (there, mt)}
+    result = {"host": a.host, "in_sync": False, "stopped": [], "warnings": []}
+    if ih.get("claude_version") != it.get("claude_version"):
+        result["warnings"].append(f"Claude Code versions differ: {ih.get('claude_version')} here, "
+                                  f"{it.get('claude_version')} on {a.host}")
+    pre_stops = [r for r, bad in (("app_open", it.get("app_running")), ("session_open", it.get("cli_pids"))) if bad]
+    applying = a.cmd == "sync" and not a.dry_run
+    run_id = datetime.datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ-") + secrets.token_hex(2)
+    locked = []
+    try:
+        if applying:
+            locked = take_locks(here, there, mh, mt, run_id)
+        state = newest_state(here, there, mh, mt)
+        inv = inventories(side, state, result)
+        opts = merge.Opts(here_host=mh.host, there_host=mt.host, now=int(time.time()),
+                          first_run_cutoff={mh.host: FIRST_RUN_CUTOFF.get(ih["platform"], 0),
+                                            mt.host: FIRST_RUN_CUTOFF.get(it["platform"], 0)},
+                          confirm=a.confirm, keep=tuple(a.keep))
+        plan = merge.plan(state["files"], inv["here"], inv["there"], opts)
+        drop_suspect_deletes(plan, inv["warned"], result)
+        resolved = resolve_transcripts(plan, side)
+        splits = sorted(k for k, (w, _, _) in resolved.items() if w == "split")
+        if len(splits) > SPLIT_LIMIT:
+            plan.review["splits"] = [["both", k] for k in splits]
+        restop(plan, a.confirm)
+        describe(result, plan, a.all)
+        result["splits"] = len(splits)
+        result["stopped"] = pre_stops + plan.stops
+        if result["stopped"]:
+            raise Stop(3, result)
+        if not applying:
+            result["in_sync"] = not plan.actions
+            raise Stop(0 if result["in_sync"] or a.cmd == "sync" else 2, result)
+        execute(plan, resolved, side, inv, state, run_id, ih, result)
+        inv2 = inventories(side, state, {"warnings": []})
+        new = next_state(state, inv2, mh, mt, run_id, result)
+        for s in ("there", "here"):  # the other machine first, see the PRD shared-state rule
+            r, m = side[s]
+            r.call("state_write", roots(m), json.dumps(new).encode())
+        for r, m in side.values():
+            r.call("prune", {**roots(m), "days": 14})
+        result["run_id"] = run_id
+        result["in_sync"] = not any(w.startswith(("skipped", "error")) for w in result["warnings"])
+        raise Stop(0, result)
+    finally:
+        for r, m in locked:
+            r.call("lock_remove", roots(m))
+
+
+def restop(plan, confirm):
+    plan.token = merge.review_token(plan.review) if plan.review else ""
+    plan.stops = [r for r in (*merge.STOP_ORDER, "splits") if r in plan.review and confirm != plan.token]
+
+
+def drop_suspect_deletes(plan, warned, result):
+    """A file missing from a side whose file list had warnings may only be unreadable there,
+    so it is not deleted on the other side."""
+    suspect = {"here": warned["there"], "there": warned["here"]}  # a delete on here means: missing there
+    dropped = [a for a in plan.actions if a.op == "delete" and suspect[a.to]]
+    if not dropped:
+        return
+    result["warnings"].append(f"{len(dropped)} deletions not done: the other file list had warnings")
+    gone = {(a.to, a.key) for a in dropped}
+    plan.actions = [a for a in plan.actions if a not in dropped]
+    review = {r: [i for i in items if (i[0], i[1]) not in gone] for r, items in plan.review.items()}
+    plan.review = {r: items for r, items in review.items() if items}
 
 
 # ---------- locks and state ----------
@@ -166,21 +173,28 @@ def own_start() -> str:
 def take_locks(here, there, mh, mt, run_id):
     lock = {"host": mh.host, "pid": os.getpid(), "start": own_start(), "run_id": run_id}
     by_host = {mh.host: (here, mh), mt.host: (there, mt)}
-    for r, m in ((here, mh), (there, mt)):
-        held = call_json(r, "lock_read", roots(m))["lock"]
-        if not held:
-            continue
-        owner = by_host.get(held.get("host"))
-        alive = owner is None or call_json(owner[0], "proc_alive",
-                                           {**roots(owner[1]), "pid": held["pid"], "start": held["start"]})["alive"]
-        if alive:
-            raise Stop(5, {"error": f"another sync holds the lock on {m.name}: {held}"})
-        r.call("lock_remove", roots(m))
-        print(f"warning: removed a stale lock on {m.name}: {held}", file=sys.stderr)
     locked = []
-    for r, m in ((here, mh), (there, mt)):
-        r.call("lock_write", {**roots(m), "lock": lock})
-        locked.append((r, m))
+    try:
+        for r, m in ((here, mh), (there, mt)):
+            for _ in range(2):
+                out = call_json(r, "lock_write", {**roots(m), "lock": lock})
+                if out.get("ok", True):
+                    locked.append((r, m))
+                    break
+                held = out["lock"]
+                owner = by_host.get(held.get("host"))
+                alive = owner is None or call_json(owner[0], "proc_alive", {
+                    **roots(owner[1]), "pid": held["pid"], "start": held["start"]})["alive"]
+                if alive:
+                    raise Stop(5, {"error": f"another sync holds the lock on {m.name}: {held}", "in_sync": False})
+                r.call("lock_remove", roots(m))
+                print(f"warning: removed a stale lock on {m.name}: {held}", file=sys.stderr)
+            else:
+                raise Stop(5, {"error": f"could not take the lock on {m.name}", "in_sync": False})
+    except BaseException:
+        for r, m in locked:
+            r.call("lock_remove", roots(m))
+        raise
     return locked
 
 
@@ -192,19 +206,68 @@ def newest_state(here, there, mh, mt) -> dict:
     return max(found, key=lambda s: s.get("run_id", ""))
 
 
-def inventory(r, m, state):
-    cache = {k: [*e["stat"][m.host], e["hash"]] for k, e in state["files"].items() if m.host in e.get("stat", {})}
-    out = call_json(r, "inventory", {**roots(m), "folders": state["folders"].get(m.host, {})},
-                    json.dumps(cache).encode())
-    inv = {k: FileInfo(h, mt, sz) for k, (h, mt, sz) in out["files"].items()}
-    return inv, out.get("folders", {}), out.get("warnings", [])
+def inventories(side, state, result) -> dict:
+    """File lists of both sides with the same keys for the same folders."""
+    mh, mt = side["here"][1], side["there"][1]
+    prefixes = [[mh.home, mh.desktop], [mt.home, mt.desktop]]
+    known = {nc for f in state["folders"].values() for nc in f.values()}
+    out = {"warned": {}}
+    raw = {}
+    for s, (r, m) in side.items():
+        cache = {k: [*e["stat"][m.host], e["hash"]] for k, e in state["files"].items() if m.host in e.get("stat", {})}
+        given = {paths.folder_name(paths.localize(nc, m)): nc for nc in known}
+        raw[s] = call_json(r, "inventory", {**roots(m), "folders": given, "prefixes": prefixes},
+                           json.dumps(cache).encode())
+        known |= set(raw[s].get("folders", {}).values())
+        warns = raw[s].get("warnings", [])
+        if not any(k.startswith("cli/projects/") for k in raw[s]["files"]):
+            warns = warns + ["no project files found"]
+        result["warnings"] += [f"{m.name}: {w}" for w in warns]
+        out["warned"][s] = bool(warns)
+    for s, (r, m) in side.items():
+        files = remap_slugs(raw[s]["files"], m, known)
+        out[s] = {k: FileInfo(h, mt_, sz) for k, (h, mt_, sz) in files.items()}
+        out["folders_" + s] = raw[s].get("folders", {})
+    drop_clashes(out, side, result)
+    return out
 
 
-def next_state(old, inv_h, inv_t, mh, mt, fold_h, fold_t, run_id, result) -> dict:
+def remap_slugs(files: dict, m: Machine, known: set) -> dict:
+    """A folder with only memory files gets a [slug] key. If a known cwd names the same
+    folder, use the {cwd} key, so both machines agree."""
+    by_folder = {paths.folder_name(paths.localize(nc, m)): paths.localize(nc, m) for nc in known}
+    out = {}
+    for k, v in files.items():
+        if k.startswith("cli/projects/["):
+            local = paths.key_to_path(k, m)
+            rel = os.path.relpath(local, f"{m.home}/.claude")
+            folder = rel.split("/")[1]
+            if folder in by_folder:
+                k = paths.key_for("cli", rel, m, by_folder[folder]) or k
+        out[k] = v
+    return out
+
+
+def drop_clashes(inv, side, result):
+    """Two keys for one local file would overwrite each other: leave both out of this run."""
+    for s, (_, m) in side.items():
+        seen = {}
+        for k in inv[s]:
+            seen.setdefault(paths.key_to_path(k, m), []).append(k)
+        for p, ks in seen.items():
+            if len(ks) > 1:
+                result["warnings"].append(f"{m.name}: skipped, one file has two keys: {ks}")
+                for k in ks:
+                    for t in ("here", "there"):
+                        inv[t].pop(k, None)
+
+
+def next_state(old, inv, mh, mt, run_id, result) -> dict:
     files, base = {}, dict(old.get("base", {}))
-    keep_old = set(result.get("_keep_old_state", []))
-    for k in set(inv_h) | set(inv_t):
-        h, t = inv_h.get(k), inv_t.get(k)
+    keep_old = set(result.pop("_keep_old_state", []))
+    ih, it = inv["here"], inv["there"]
+    for k in set(ih) | set(it):
+        h, t = ih.get(k), it.get(k)
         if k in keep_old or not (h and t and h.hash == t.hash):
             if k in old["files"]:
                 files[k] = old["files"][k]
@@ -214,114 +277,163 @@ def next_state(old, inv_h, inv_t, mh, mt, fold_h, fold_t, run_id, result) -> dic
         if k not in keep_old:
             base[k] = obj
     base = {k: v for k, v in base.items() if k in files}
-    result.pop("_keep_old_state", None)
-    return {"version": 1, "run_id": run_id, "files": files,
-            "folders": {**old.get("folders", {}), mh.host: fold_h, mt.host: fold_t}, "base": base}
+    folders = {**old.get("folders", {}), mh.host: inv["folders_here"], mt.host: inv["folders_there"]}
+    return {"version": 1, "run_id": run_id, "files": files, "folders": folders, "base": base}
 
 
-# ---------- executing a plan ----------
+# ---------- helper transfers, in batches ----------
 
-def execute(plan, here, there, mh, mt, state, run_id, ih, result):
-    side = {"here": (here, mh), "there": (there, mt)}
-    other = {"here": "there", "there": "here"}
-    copies = {"here": [], "there": []}
-    base, keep_old = {}, []
-    for act in plan.actions:
-        if act.op == "copy":
-            copies[act.to].append(act.key)
-    for a in [a for a in plan.actions if a.op in ("transcript", "json_merge", "conflict")]:
-        both = {s: unpack(side[s][0].call("pack", {**roots(side[s][1]), "keys": [a.key]})) for s in side}
-        h, t = both["here"][a.key], both["there"][a.key]
-        if a.op == "transcript":
-            winner = merge.resolve_transcript(paths.normalize_bytes(a.key, h[0], mh),
-                                              paths.normalize_bytes(a.key, t[0], mt))
-            if winner == "split":
-                split(a.key, t, here, there, mh, mt, run_id, result)
-                winner = "here"
-            copies[other[winner]].append(a.key)
-        elif a.op == "conflict":
-            copies["there"].append(a.key)
-            send(here, mh, run_id, mt, {"conflicts/" + a.key: t})
-            result.setdefault("conflicts", []).append(a.key)
-        else:
-            neutral = {s: json.loads(paths.normalize_bytes(a.key, v[a.key][0], side[s][1])) for s, v in both.items()}
-            merged, over = merge.merge_json(state["base"].get(a.key), neutral["here"], neutral["there"],
-                                            here_is_newer=h[1] >= t[1])
-            data = json.dumps(merged, ensure_ascii=False, indent=2).encode()
-            member = {a.key: (data, max(h[1], t[1]))}
-            for s in ("there", "here"):
-                send(side[s][0], side[s][1], run_id, NEUTRAL_M, member)
-            base[a.key] = merged
-            if ih.get("app_running"):  # the app on this machine may write its old copy back
-                keep_old.append(a.key)
-            if over:
-                result["warnings"].append(f"{a.key}: both machines changed {', '.join(over)}; the newer value won")
-    for to in ("there", "here"):
-        keys = copies[to]
-        if not keys:
-            continue
-        src_r, src_m = side[other[to]]
-        tar = src_r.call("pack", {**roots(src_m), "keys": keys})
-        for k, (data, _) in unpack(tar).items():
-            if paths.classify(k) in JSON_KINDS:
-                base[k] = json.loads(paths.normalize_bytes(k, data, src_m))
-                if to == "here" and ih.get("app_running"):
-                    keep_old.append(k)
-        dst_r, dst_m = side[to]
-        errors = call_json(dst_r, "apply", {**roots(dst_m), "run_id": run_id, "src": roots(src_m)}, tar)["errors"]
-        result["warnings"] += [f"{dst_m.name}: {e}" for e in errors]
-    for to in ("here", "there"):
-        keys = [a.key for a in plan.actions if a.op == "delete" and a.to == to]
-        if keys:
-            r, m = side[to]
-            result["warnings"] += call_json(r, "delete", {**roots(m), "run_id": run_id, "keys": keys})["errors"]
-    result["_base"], result["_keep_old_state"] = base, keep_old
-    result["skipped_live"] = plan.skipped_live
+def chunks(keys):
+    keys = list(keys)
+    return [keys[i:i + BATCH] for i in range(0, len(keys), BATCH)]
 
 
-def split(key, there_copy, here, there, mh, mt, run_id, result):
-    """Both machines continued one transcript: the other machine's copy becomes a new session."""
-    old_id = os.path.basename(key)[:-len(".jsonl")]
-    new_id = str(uuid.uuid4())
-    new_key = key[: -len(old_id + ".jsonl")] + new_id + ".jsonl"
-    data = merge.split_transcript(there_copy[0], old_id, new_id)
-    members = {new_key: (data, there_copy[1])}
-    history = [k for k in call_json(there, "inventory", {**roots(mt), "folders": {}})["files"]
-               if k.startswith(f"cli/file-history/{old_id}/")]
-    if history:
-        for k, v in unpack(there.call("pack", {**roots(mt), "keys": history})).items():
-            members[k.replace(f"/{old_id}/", f"/{new_id}/", 1)] = v
-    for r, m in ((there, mt), (here, mh)):
-        send(r, m, run_id, mt, members)
-    result.setdefault("split_sessions", []).append({"from": key, "new": new_key})
+def pack(r, m, keys) -> dict:
+    """key -> (content, mtime, mode)"""
+    out = {}
+    for part in chunks(keys):
+        out.update(unpack(r.call("pack", roots(m), json.dumps({"keys": part}).encode())))
+    return out
 
 
 def unpack(tar_bytes: bytes) -> dict:
-    """key -> (content, mtime)"""
     out = {}
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r|gz") as tar:
         for member in tar:
             if member.isfile():
-                out[member.name] = (tar.extractfile(member).read(), int(member.mtime))
+                out[member.name] = (tar.extractfile(member).read(), int(member.mtime), member.mode)
     return out
 
 
-def send(r, m, run_id, src_m, members: dict):
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w|gz") as tar:
-        for name, (data, mtime) in members.items():
-            info = tarfile.TarInfo(name)
-            info.size, info.mtime = len(data), mtime
-            tar.addfile(info, io.BytesIO(data))
-    r.call("apply", {**roots(m), "run_id": run_id, "src": roots(src_m)}, buf.getvalue())
+def apply(r, m, run_id, src_m, members: dict, inv_dst: dict, result):
+    """Write members on m. A target that changed since the file list is skipped by the helper."""
+    for part in chunks(members):
+        expect = {k: ([inv_dst[k].mtime, inv_dst[k].size] if k in inv_dst else None)
+                  for k in part if not k.startswith("conflicts/")}
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w|gz") as tar:
+            add(tar, EXPECT, json.dumps(expect).encode(), 0, 0o600)
+            for k in part:
+                add(tar, k, *members[k])
+        out = call_json(r, "apply", {**roots(m), "run_id": run_id, "src": roots(src_m)}, buf.getvalue())
+        note(result, m, out)
+
+
+def add(tar, name, data, mtime, mode=0o600):
+    info = tarfile.TarInfo(name)
+    info.size, info.mtime, info.mode = len(data), mtime, mode
+    tar.addfile(info, io.BytesIO(data))
+
+
+def delete(r, m, run_id, keys, inv_dst, result):
+    for part in chunks(keys):
+        expect = {k: [inv_dst[k].mtime, inv_dst[k].size] for k in part if k in inv_dst}
+        out = call_json(r, "delete", {**roots(m), "run_id": run_id},
+                        json.dumps({"keys": part, "expect": expect}).encode())
+        note(result, m, out)
+
+
+def note(result, m, out):
+    result["warnings"] += [f"error on {m.name}: {e}" for e in out.get("errors", [])]
+    result["warnings"] += [f"skipped on {m.name}, changed during the run: {k}" for k in out.get("skipped", [])]
+
+
+# ---------- executing a plan ----------
+
+def resolve_transcripts(plan, side) -> dict:
+    """key -> (winner, here copy, there copy) for each transcript changed on both machines.
+    Runs before any write, so status can show the splits."""
+    keys = [a.key for a in plan.actions if a.op == "transcript"]
+    if not keys:
+        return {}
+    (hr, mh), (tr, mt) = side["here"], side["there"]
+    prefixes = [[mh.home, mh.desktop], [mt.home, mt.desktop]]
+    h, t = pack(hr, mh, keys), pack(tr, mt, keys)
+    out = {}
+    for k in keys:
+        winner = merge.resolve_transcript(paths.normalize_bytes(k, h[k][0], mh, prefixes),
+                                          paths.normalize_bytes(k, t[k][0], mt, prefixes))
+        out[k] = (winner, h[k], t[k])
+    return out
+
+
+def execute(plan, resolved, side, inv, state, run_id, ih, result):
+    other = {"here": "there", "there": "here"}
+    copies = {"here": [a.key for a in plan.actions if a.op == "copy" and a.to == "here"],
+              "there": [a.key for a in plan.actions if a.op == "copy" and a.to == "there"]}
+    base, keep_old = {}, []
+    for key, (winner, h, t) in resolved.items():
+        if winner == "split":
+            split(key, t, side, inv, run_id, result)
+            winner = "here"
+        copies[other[winner]].append(key)
+    both = [a.key for a in plan.actions if a.op in ("json_merge", "conflict")]
+    got = {s: pack(*side[s], both) for s in side} if both else {}
+    for a in [a for a in plan.actions if a.op in ("json_merge", "conflict")]:
+        h, t = got["here"][a.key], got["there"][a.key]
+        if a.op == "conflict":
+            copies["there"].append(a.key)
+            apply(*side["here"], run_id, side["there"][1], {"conflicts/" + a.key: t}, {}, result)
+            result.setdefault("conflicts", []).append(a.key)
+            continue
+        neutral = {s: json.loads(paths.normalize_bytes(a.key, v[a.key][0], side[s][1])) for s, v in got.items()}
+        merged, over = merge.merge_json(state["base"].get(a.key), neutral["here"], neutral["there"],
+                                        here_is_newer=h[1] >= t[1])
+        member = {a.key: (json.dumps(merged, ensure_ascii=False, indent=2).encode(), max(h[1], t[1]), 0o600)}
+        for s in ("there", "here"):
+            apply(*side[s], run_id, NEUTRAL_M, member, inv[s], result)
+        base[a.key] = merged
+        if ih.get("app_running"):  # the app on this machine may write its old copy back
+            keep_old.append(a.key)
+        if over:
+            result["warnings"].append(f"{a.key}: both machines changed {', '.join(over)}; the newer value won")
+    for to in ("there", "here"):
+        if not copies[to]:
+            continue
+        src_r, src_m = side[other[to]]
+        members = pack(src_r, src_m, copies[to])
+        for k, (data, _, _) in members.items():
+            if paths.classify(k) in JSON_KINDS:
+                base[k] = json.loads(paths.normalize_bytes(k, data, src_m))
+                if to == "here" and ih.get("app_running"):
+                    keep_old.append(k)
+        apply(*side[to], run_id, src_m, members, inv[to], result)
+    for to in ("here", "there"):
+        keys = [a.key for a in plan.actions if a.op == "delete" and a.to == to]
+        if keys:
+            delete(*side[to], run_id, keys, inv[to], result)
+    result["_base"], result["_keep_old_state"] = base, keep_old
+    result["skipped_live"] = plan.skipped_live
+
+
+def split(key, there_copy, side, inv, run_id, result):
+    """Both machines continued one transcript: the other machine's copy becomes a new session,
+    with its subagent files, rewind checkpoints and Code tab entry."""
+    tr, mt = side["there"]
+    old_id = os.path.basename(key)[:-len(".jsonl")]
+    new_id = str(uuid.uuid4())
+    folder = key[:-len(old_id + ".jsonl")]
+    members = {folder + new_id + ".jsonl": (merge.split_transcript(there_copy[0], old_id, new_id), *there_copy[1:])}
+    extra = [k for k in inv["there"] if k.startswith((f"{folder}{old_id}/", f"cli/file-history/{old_id}/"))]
+    for k, v in pack(tr, mt, extra).items():
+        members[k.replace(f"/{old_id}/", f"/{new_id}/", 1)] = v
+    sessions = [k for k in inv["there"] if paths.classify(k) == "session"]
+    for k, (data, mtime, mode) in pack(tr, mt, sessions).items():
+        obj = json.loads(data)
+        if obj.get("cliSessionId") == old_id:
+            obj.update(sessionId="local_" + str(uuid.uuid4()), cliSessionId=new_id,
+                       title=f"{obj.get('title', 'Session')} (from {mt.name})")
+            members[k.rsplit("/", 1)[0] + "/" + obj["sessionId"] + ".json"] = (json.dumps(obj).encode(), mtime, mode)
+    for s in ("there", "here"):
+        apply(*side[s], run_id, mt, members, inv[s], result)
+    result.setdefault("split_sessions", []).append({"from": key, "new": folder + new_id + ".jsonl"})
 
 
 # ---------- output ----------
 
 def describe(result, plan, show_all):
-    to_here = sum(a.to == "here" and a.op == "copy" for a in plan.actions)
-    to_host = sum(a.to == "there" and a.op == "copy" for a in plan.actions)
-    result["files"] = {"to_here": to_here, "to_host": to_host,
+    result["files"] = {"to_here": sum(a.to == "here" and a.op == "copy" for a in plan.actions),
+                       "to_host": sum(a.to == "there" and a.op == "copy" for a in plan.actions),
                        "deletions": sum(a.op == "delete" for a in plan.actions),
                        "both_changed": sum(a.op in ("transcript", "json_merge", "conflict") for a in plan.actions)}
     result["review"] = {r: cap(items, show_all) for r, items in plan.review.items()}
@@ -375,11 +487,14 @@ def emit(a, result):
 # ---------- undo and unlock ----------
 
 def undo(a) -> int:
-    out = {}
-    for name, r in (("here", runner(None)), (a.host, runner(a.host))):
-        out[name] = call_json(r, "undo", {**roots(machine(name, info(r, name))), "run_id": None})
-    # ponytail: the state keeps the undone run; the next run sees equal hashes and records them.
-    emit(a, {"host": a.host, "undo": out, "in_sync": False})
+    here, there = runner(None), runner(a.host)
+    ms = {"here": (here, machine("here", info(here, "here"))), a.host: (there, machine(a.host, info(there, a.host)))}
+    state = newest_state(here, there, ms["here"][1], ms[a.host][1])
+    if not state["run_id"]:
+        raise Stop(1, {"host": a.host, "error": "no run to undo", "in_sync": False})
+    out = {name: call_json(r, "undo", {**roots(m), "run_id": state["run_id"]}) for name, (r, m) in ms.items()}
+    # ponytail: the state still names the undone run; the next run compares hashes and asks about the differences.
+    emit(a, {"host": a.host, "run_id": state["run_id"], "undo": out, "in_sync": False})
     return 0
 
 

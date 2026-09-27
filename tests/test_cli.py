@@ -120,6 +120,50 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(self.get(self.u, "skills/x/SKILL.md"), b"new skill")
 
+    def test_scratch_session_under_the_desktop_folder(self):
+        # A Code tab scratch session: its cwd is inside the desktop folder.
+        cwd = self.m["desktop"] + "/scratch-workspaces/o/a/scratch-1"
+        line = json.dumps({"type": "user", "cwd": cwd, "sessionId": "s9"}, separators=(",", ":")).encode() + b"\n"
+        self.put(self.m, f"projects/{paths.folder_name(cwd)}/s9.jsonl", line)
+        self.assertEqual(self.sync()[0], 0)
+        ucwd = self.u["desktop"] + "/scratch-workspaces/o/a/scratch-1"
+        moved = json.loads(self.get(self.u, f"projects/{paths.folder_name(ucwd)}/s9.jsonl"))
+        self.assertEqual(moved["cwd"], ucwd)
+
+    def test_migrated_copy_with_rewritten_text_is_in_sync(self):
+        # The migration replaced the home path in all text, not only in path fields.
+        mcwd, ucwd = self.m["home"] + "/dev/x", self.u["home"] + "/dev/x"
+        def t(home, cwd):
+            return (json.dumps({"cwd": cwd, "sessionId": "s1", "message": f"see {home}/notes"},
+                               separators=(",", ":")) + "\n").encode()
+        self.put(self.m, f"{self.project(self.m)}/s1.jsonl", t(self.m["home"], mcwd))
+        self.put(self.u, f"{self.project(self.u)}/s1.jsonl", t(self.u["home"], ucwd))
+        code, out = self.sync("status")
+        self.assertEqual((code, out["files"]["both_changed"], out["splits"]), (0, 0, 0), out)
+
+    def test_memory_only_folder_joins_the_same_key(self):
+        mcwd = self.m["home"] + "/dev/x"
+        line = json.dumps({"cwd": mcwd, "sessionId": "s1"}, separators=(",", ":")).encode() + b"\n"
+        self.put(self.m, f"{self.project(self.m)}/s1.jsonl", line)
+        self.put(self.m, f"{self.project(self.m)}/memory/MEMORY.md", b"mac memory")
+        self.put(self.u, f"{self.project(self.u)}/memory/MEMORY.md", b"ubuntu memory")
+        code, out = self.sync()
+        self.assertEqual(code, 0, out)
+        self.assertFalse(any("two keys" in w for w in out["warnings"]), out["warnings"])
+        self.assertIn("cli/projects/{~/dev/x}/memory/MEMORY.md", out.get("conflicts", []))
+
+    def test_undo_reverts_only_the_last_run(self):
+        self.seed()
+        self.assertEqual(self.sync()[0], 0)
+        self.put(self.u, "plans/p.md", b"ubuntu v2", mtime=OLD + 10)
+        self.assertEqual(self.sync()[0], 0)
+        self.assertEqual(self.get(self.m, "plans/p.md"), b"ubuntu v2")
+        p = subprocess.run([sys.executable, f"{REPO}/claude-sync", "undo", "ubu", "--json"],
+                           env=self.env, capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.get(self.m, "plans/p.md"), b"plan", "the Mac file goes back")
+        self.assertEqual(self.get(self.u, "plans/p.md"), b"ubuntu v2", "the Ubuntu edit is not touched")
+
     def test_lock_blocks_a_second_run(self):
         lock = {"host": "mac", "pid": os.getpid(), "run_id": "x",
                 "start": subprocess.run(["ps", "-o", "lstart=", "-p", str(os.getpid())],
