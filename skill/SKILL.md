@@ -19,7 +19,7 @@ Call this host `HOST` in the steps below.
 ## Steps
 
 1. Run `claude-sync status HOST --json`.
-2. Run every fast-forward pull listed in `parts.git` (items whose `next` contains `pull --ff-only`), whatever the exit code. These need no question.
+2. Run the `next` command of every item in `parts.git` whose `state` is `behind`, whatever the exit code. These are fast-forward pulls and need no question.
 3. If the exit code is 3, read the `stopped` reasons in the JSON. Handle each reason:
    - `git`: show the user each repo in `parts.git` that needs a decision, one at a time, with a recommendation. Run only the git steps the user agrees to. For a repo the user wants to leave as it is, add `--skip-repo PATH`.
    - `app_open` or `session_open`: ask the user to quit the desktop app, or the CLI session, on the other machine.

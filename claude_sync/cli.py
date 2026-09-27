@@ -121,6 +121,7 @@ def run(a) -> int:
                           confirm=a.confirm, keep=tuple(a.keep))
         plan = merge.plan(state["files"], inv["here"], inv["there"], opts)
         drop_suspect_deletes(plan, inv["warned"], result)
+        guard_dev(plan, inv, result)
         resolved = resolve_transcripts(plan, side)
         splits = sorted(k for k, (w, _, _) in resolved.items() if w == "split")
         if len(splits) > SPLIT_LIMIT:
@@ -183,6 +184,32 @@ def plan_parts(ctx) -> dict:
 def restop(plan, confirm):
     plan.token = merge.review_token(plan.review) if plan.review else ""
     plan.stops = [r for r in (*merge.STOP_ORDER, "splits") if r in plan.review and confirm != plan.token]
+
+
+def guard_dev(plan, inv, result):
+    """Files in ~/dev are people's documents: every deletion there is reviewed, a file that is now
+    inside a repo or a skipped folder on the other machine is never deleted, and a repo's
+    settings.local.json only goes to a machine that has that repo."""
+    other = {"here": "there", "there": "here"}
+    def inside(key, s):
+        path = "~/dev/" + key[len("dev/"):]
+        return any(path == r or path.startswith(r.rstrip("/") + "/") for r in inv["dev_repos_" + s])
+    keep = []
+    for a in plan.actions:
+        if a.key.startswith("dev/") and a.op == "delete" and inside(a.key, other[a.to]):
+            result["warnings"].append(f"not deleted, now inside a repo or skipped folder on the other machine: {a.key}")
+            continue
+        if a.key.endswith("/.claude/settings.local.json") and a.key.startswith("dev/") and a.op == "copy":
+            repo = "~/dev/" + a.key[len("dev/"):-len("/.claude/settings.local.json")]
+            if repo not in inv["dev_repos_" + a.to]:
+                result["warnings"].append(f"not copied, the repo is not on that machine: {a.key}")
+                continue
+        keep.append(a)
+    plan.actions = keep
+    dev_del = {(a.to, a.key) for a in keep if a.op == "delete" and a.key.startswith("dev/")}
+    if dev_del:
+        old = {tuple(i) for i in plan.review.get("deletions", [])}
+        plan.review["deletions"] = sorted([list(i) for i in old | dev_del])
 
 
 def drop_suspect_deletes(plan, warned, result):
@@ -258,7 +285,8 @@ def inventories(side, state, result) -> dict:
         known |= set(raw[s].get("folders", {}).values())
         warns = raw[s].get("warnings", [])
         # A folder that had files at the last sync and has none now is suspect (moved, symlinked, reinstalled).
-        for prefix, what in (("cli/projects/", "project files"), ("desktop/claude-code-sessions/", "desktop sessions")):
+        for prefix, what in (("cli/projects/", "project files"), ("desktop/claude-code-sessions/", "desktop sessions"),
+                             ("dev/", "dev files")):
             if (any(k.startswith(prefix) for k in state["files"])
                     and not any(k.startswith(prefix) for k in raw[s]["files"])):
                 warns = warns + [f"no {what} found"]
@@ -268,6 +296,7 @@ def inventories(side, state, result) -> dict:
         files = remap_slugs(raw[s]["files"], m, known)
         out[s] = {k: FileInfo(h, mt_, sz) for k, (h, mt_, sz) in files.items()}
         out["folders_" + s] = raw[s].get("folders", {})
+        out["dev_repos_" + s] = raw[s].get("dev_repos", [])
     drop_clashes(out, side, result)
     return out
 
