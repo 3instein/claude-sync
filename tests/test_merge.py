@@ -179,6 +179,12 @@ class Content(unittest.TestCase):
         self.assertEqual(merge.resolve_transcript(lines(self.A, self.B), lines(self.A)), "here")
         self.assertEqual(merge.resolve_transcript(lines(self.A), lines(self.A)), "here")
 
+    def test_metadata_only_lines_do_not_split(self):
+        cost = {"type": "cost-state", "sessionId": "s1"}
+        user = {"type": "user", "uuid": "9", "sessionId": "s1"}
+        self.assertEqual(merge.resolve_transcript(lines(self.A, cost), lines(self.A, user)), "there")
+        self.assertEqual(merge.resolve_transcript(lines(self.A, user), lines(self.A, cost)), "here")
+
     def test_divergent_copies_split(self):
         self.assertEqual(merge.resolve_transcript(lines(self.A, self.B), lines(self.A, self.C)), "split")
 

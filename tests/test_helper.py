@@ -66,6 +66,7 @@ class Inventory(Base):
         self.put(self.mac, "projects/-x-memory-only/memory/a.md", b"m")
         self.put(self.mac, "skills/.DS_Store", b"junk")
         self.put(self.mac, "telemetry/t.json", b"out of scope")
+        self.put(self.mac, "skills/synced/acct/x/SKILL.md", b"managed by the app")
         os.symlink("/etc/hosts", f"{self.mac.home}/.claude/skills/link")
         files = self.call(self.mac, "inventory", folders={})["files"]
         key = "cli/projects/{~/dev/x}/s1.jsonl"
@@ -73,7 +74,7 @@ class Inventory(Base):
         h, mtime, size = files[key]
         self.assertEqual((mtime, size), (MTIME, data.index(b"\n") + 1), "the partial last line is not counted")
         self.assertIn("cli/projects/[-x-memory-only]/memory/a.md", files)
-        self.assertFalse(any(k.startswith("cli/telemetry") or "DS_Store" in k or k.endswith("link") for k in files))
+        self.assertFalse(any(k.startswith(("cli/telemetry", "cli/skills/synced")) or "DS_Store" in k or k.endswith("link") for k in files))
 
     def test_same_hash_on_both_machines(self):
         for m in (self.mac, self.ubu):

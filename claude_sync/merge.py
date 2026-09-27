@@ -118,6 +118,25 @@ def _complete_lines(data: bytes) -> list:
     return data.split(b"\n")[:-1]
 
 
+# Lines the app adds on its own (cost, titles, queue, links). Measured on real data: after the
+# migration the Mac added a few of these to sessions that then continued on Ubuntu. They alone
+# must not split a conversation; the losing copy's extra metadata lines are dropped.
+META_TYPES = {"cost-state", "bridge-session", "last-prompt", "queue-operation", "custom-title",
+              "agent-name", "mode", "atis-latch", "pr-link"}
+
+
+def _conversation(lines):
+    out = []
+    for line in lines:
+        try:
+            kind = json.loads(line).get("type")
+        except (ValueError, AttributeError, RecursionError):
+            kind = None
+        if kind not in META_TYPES:
+            out.append(line)
+    return out
+
+
 def resolve_transcript(here: bytes, there: bytes) -> str:
     """here | there | split"""
     h, t = _complete_lines(here), _complete_lines(there)
@@ -125,6 +144,11 @@ def resolve_transcript(here: bytes, there: bytes) -> str:
         return "here"
     if t[:len(h)] == h:
         return "there"
+    hc, tc = _conversation(h), _conversation(t)
+    if hc[:len(tc)] == tc and len(hc) > len(tc):
+        return "here"
+    if tc[:len(hc)] == hc:
+        return "there" if len(tc) > len(hc) or len(t) > len(h) else "here"
     return "split"
 
 

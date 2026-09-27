@@ -13,7 +13,7 @@ import tempfile
 import time
 
 try:
-    from claude_sync.model import Machine, CLI_ITEMS, DESKTOP_ITEMS, SKIP_NAMES
+    from claude_sync.model import Machine, CLI_ITEMS, DESKTOP_ITEMS, SKIP_NAMES, SKIP_PATHS
     from claude_sync.paths import *  # noqa: F401,F403
 except ImportError:  # inside the combined program the names already exist
     pass
@@ -173,7 +173,9 @@ def _walk_root(base_dir, items, root, warnings):
 
         for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
             dirnames[:] = [d for d in dirnames
-                           if d not in SKIP_NAMES and not os.path.islink(os.path.join(dirpath, d))]
+                           if d not in SKIP_NAMES and not os.path.islink(os.path.join(dirpath, d))
+                           and os.path.relpath(os.path.join(dirpath, d), base_dir).replace(os.sep, "/")
+                           not in SKIP_PATHS]
             for fn in filenames:
                 full = os.path.join(dirpath, fn)
                 if fn in SKIP_NAMES or os.path.islink(full):

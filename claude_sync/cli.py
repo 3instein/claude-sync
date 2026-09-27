@@ -212,7 +212,7 @@ def newest_state(here, there, mh, mt) -> dict:
 def inventories(side, state, result) -> dict:
     """File lists of both sides with the same keys for the same folders."""
     mh, mt = side["here"][1], side["there"][1]
-    prefixes = [[mh.home, mh.desktop], [mt.home, mt.desktop]]
+    prefixes = loose_prefixes(mh, mt)
     known = {nc for f in state["folders"].values() for nc in f.values()}
     out = {"warned": {}}
     raw = {}
@@ -236,6 +236,13 @@ def inventories(side, state, result) -> dict:
         out["folders_" + s] = raw[s].get("folders", {})
     drop_clashes(out, side, result)
     return out
+
+
+def loose_prefixes(mh, mt):
+    """Both machines' folders for the loose hash. The migration replaced only the home part of
+    the Mac desktop folder, so both desktop layouts are listed under each home."""
+    layouts = ("/Library/Application Support/Claude", "/.config/Claude")
+    return [[m.home, m.desktop] for m in (mh, mt)] + [[m.home, m.home + l] for m in (mh, mt) for l in layouts]
 
 
 def remap_slugs(files: dict, m: Machine, known: set) -> dict:
@@ -360,7 +367,7 @@ def resolve_transcripts(plan, side) -> dict:
     if not keys:
         return {}
     (hr, mh), (tr, mt) = side["here"], side["there"]
-    prefixes = [[mh.home, mh.desktop], [mt.home, mt.desktop]]
+    prefixes = loose_prefixes(mh, mt)
     h, t = pack(hr, mh, keys), pack(tr, mt, keys)
     out = {}
     for k in [k for k in keys if k in h and k in t]:

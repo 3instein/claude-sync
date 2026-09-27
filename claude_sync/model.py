@@ -10,6 +10,8 @@ CLI_ITEMS = ("CLAUDE.md", "settings.json", ".i-have-adhd-always", ".ponytail-act
              "skills", "agents", "commands", "plans", "projects", "file-history", "uploads")
 DESKTOP_ITEMS = ("claude-code-sessions", "scratch-workspaces")
 SKIP_NAMES = ("scheduled-tasks.json", ".DS_Store")
+# The desktop app syncs these itself from claude.ai, per machine.
+SKIP_PATHS = ("skills/synced",)
 
 
 @dataclass(frozen=True)
