@@ -73,6 +73,15 @@ class HistoryPart(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(len(self.get_history(self.u)), 1)
 
+    def test_line_without_timestamp_does_not_crash_and_sorts_first(self):
+        self.put_history(self.m, [
+            {"display": "no-time", "sessionId": "s1", "project": self.m["home"]},
+            {"display": "with-time", "timestamp": 5, "sessionId": "s2", "project": self.m["home"]},
+        ])
+        code, out = self.sync()
+        self.assertEqual(code, 0, out)
+        self.assertEqual([e["display"] for e in self.get_history(self.u)], ["no-time", "with-time"])
+
 
 if __name__ == "__main__":
     unittest.main()
