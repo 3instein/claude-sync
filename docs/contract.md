@@ -152,3 +152,19 @@ The inventory lists regular files under the phase 1 items (`model.CLI_ITEMS`, `m
 ## JSON output of the cli
 
 See the PRD, section Commands. Exit codes: 0 done or in sync, 1 error, 2 not in sync (`status` only), 3 a decision is needed, 4 the other machine is not reachable, 5 another sync holds the lock.
+
+## Fix round 1 (after the adversarial code review)
+
+These rules replace the earlier text where they differ.
+
+1. **Loose hash.** The migration replaced the home path in all text, not only in path fields (checked on real transcripts: 73 of 336 lines differ, all only in the home path). So `normalize_bytes(key, data, m, prefixes=())` takes `prefixes`, a list of `[home, desktop]` pairs of all machines. After the path-field mapping, it replaces every occurrence of each desktop folder with `{desktop}` and then of each home folder with `~` in the whole content (longest prefix first, at a path boundary as in `settings.json`). This applies to every kind, `raw` included. It is only for hashes and for `resolve_transcript` input; written content does not change. `inventory` takes `prefixes` in its args.
+2. **Key tokens.** A cwd can contain `}` or `{desktop}`. In a `{...}` or `[...]` token, the characters `%`, `{`, `}`, `[`, `]` are written as `%25`, `%7B`, `%7D`, `%5B`, `%5D`. `key_to_path` decodes them. So `cli/projects/{%7Bdesktop%7D/scratch-workspaces/x}/s.jsonl` is the key of a Code tab scratch session.
+3. **Safe keys.** `paths.safe_key(key) -> bool`: false for an empty segment, `.` or `..` segments, a leading `/`, a NUL, or a root that is not `cli` or `desktop`. A `conflicts/` member name must be `conflicts/` plus a safe key. `pack`, `apply`, `delete` and the cli refuse unsafe keys. `apply` also checks that the real path of the target stays under its root.
+4. **Keys on stdin.** `pack` and `delete` read `{"keys": [...]}` from stdin, not from args, because one SSH argument is limited to 128 KB. The cli sends at most 500 keys per call.
+5. **Apply precondition.** The first tar member may be `.claude-sync-expect.json`: `{key: [mtime, size] or null}`. `apply` skips a key whose target exists with a different mtime or size (or exists when `null` is expected), and reports it in `skipped`. `delete` takes `expect` in its stdin object the same way.
+6. **Modes.** A file whose source had any execute bit is written with mode 700, else 600. The tar member mode carries it.
+7. **Inventory warnings.** An item in `CLI_ITEMS` or `DESKTOP_ITEMS` that is a symlink, an unreadable folder, or an `os.walk` error adds a warning. A missing item does not (a new machine can lack `agents/`), but the cli treats a missing `projects` folder as a warning.
+8. **Atomic lock.** `lock_write` creates the file with `O_CREAT | O_EXCL` and returns `{"ok": false, "lock": existing}` when a lock exists.
+9. **Undo.** `undo` requires a `run_id`; the cli uses the run id in the state and undoes it on both machines. The manifest records the mtime and size that the run wrote. `undo` skips a file that changed after the run, backs up the current file before it restores or removes, and reports skipped files.
+10. **Deletions.** Every deletion counts toward the limit: no exemption for old transcripts. A `keep` pattern also applies to rule 3: a kept deletion becomes a `copy` back.
+11. **Splits.** Before it writes anything, the cli resolves every `transcript` action. More than 10 splits in one run is a stop reason, `splits`, whose list is part of the review and the token.
