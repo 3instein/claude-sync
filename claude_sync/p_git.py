@@ -68,10 +68,10 @@ def plan(ctx):
             if rec["origin"]:
                 cmd = f"git clone {shlex.quote(rec['origin'])} {shlex.quote(paths.localize(neutral_path, m_miss))}"
                 entry["next"] = _next_cmd(cmd, miss_side, m_miss.name)
-            else:
+                need_stop = True
+            else:  # nothing can be cloned, so a stop could never clear: warn only, as for no remote
                 ctx.result["warnings"].append(f"{neutral_path}: only on one machine, and it has no remote to clone")
             reports.append(entry)
-            need_stop = True
             continue
         for side, rec in (("here", here_rec), ("there", there_rec)):
             m = mh if side == "here" else mt
@@ -85,7 +85,8 @@ def plan(ctx):
     ctx.result["parts"]["git"] = reports
     if need_stop:
         ctx.stops.append("git")
-    return reports or None
+    # Only a stop or a pending pull keeps the machines out of sync; warnings alone do not.
+    return reports if need_stop or any("next" in r for r in reports) else None
 
 
 def apply(ctx, plan):
