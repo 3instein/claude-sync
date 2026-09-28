@@ -32,7 +32,7 @@ BATCH = 500        # keys per helper call: one SSH argument is limited to 128 KB
 SPLIT_LIMIT = 10   # more transcript splits than this in one run needs a confirm
 EXPECT = ".claude-sync-expect.json"
 # Phase 2 parts, in run order. A part module that does not exist yet is skipped.
-PART_MODULES = ("p_history", "p_mcp", "p_plugins", "p_git", "p_secrets")
+PART_MODULES = ("p_history", "p_mcp", "p_plugins", "p_git", "p_secrets", "p_update")
 # Tests only: {"here": info overrides, "<host>": info overrides}. Both sides then run locally.
 TEST_ROOTS = json.loads(os.environ.get("CLAUDE_SYNC_TEST_ROOTS", "null"))
 

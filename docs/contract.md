@@ -224,3 +224,7 @@ A part is a module `claude_sync/p_<name>.py` with `NAME`, `plan(ctx)` and `apply
    - Undo: the part's warning says that `undo` restores `~/.claude.json` only if Claude Code has not written it since.
 7. **history.** A line without a `timestamp` sorts first and never crashes the part; identity comparison uses sets.
 8. **Secret patterns.** Add `credentials` (no extension), `*.jks`, `*.keystore`, `id_ecdsa*`, `.pgpass`, `.git-credentials`, `*.tfvars`, `auth.json`. `pack` and `apply` refuse a key whose file name is a secret. `.DS_Store` and the other `SKIP_NAMES` are skipped in `dev` too.
+
+## The update part (added 2026-09-28)
+
+`p_update.py` with `h_update.py`: on a real sync, `apply` runs `claude update` on both machines with the native install at `<home>/.local/bin/claude` (never a `claude` from elsewhere on PATH, so a test can never update the real binary), and reports each machine's version before and after in `result["parts"]["update"]`. `status` only reports the versions and returns no plan, so it never counts as out of sync. A machine without that binary gets a `note:` warning; a failed update gets an `error:` warning. When both machines end on the same version, the start-of-run "versions differ" warning is removed. The desktop app's own copy of Claude Code is not touched.
